@@ -10,7 +10,7 @@ Supports **text generation**, **vision (image understanding)**, and **streaming*
 
 - iOS 17.0+
 - Xcode 16+
-- iPhone 15 Pro or later (8 GB RAM required for Gemma 4 E2B)
+- iPhone 13 Pro or later (6 GB+ RAM required for Gemma 4 E2B)
 - `increased-memory-limit` entitlement (model loading needs ~4 GB RAM)
 
 <details>
