@@ -62,6 +62,9 @@ typedef struct LiteRtLmSessionConfig LiteRtLmSessionConfig;
 // Opaque pointer for LiteRT LM Conversation Config.
 typedef struct LiteRtLmConversationConfig LiteRtLmConversationConfig;
 
+// Opaque pointer for session-ready preprocessed audio.
+typedef struct LiteRtLmPreprocessedAudio LiteRtLmPreprocessedAudio;
+
 // Represents the type of sampler.
 typedef enum {
   kTypeUnspecified = 0,
@@ -142,6 +145,7 @@ typedef enum {
   kInputImageEnd,
   kInputAudio,
   kInputAudioEnd,
+  kInputAudioPreprocessed,
 } InputDataType;
 
 // Represents a single piece of input data.
@@ -150,6 +154,7 @@ typedef struct {
   // The data pointer. The interpretation depends on the `type`.
   // For kInputText, it's a UTF-8 string.
   // For kInputImage and kInputAudio, it's a pointer to the raw bytes.
+  // For kInputAudioPreprocessed, it's a LiteRtLmPreprocessedAudio* handle.
   const void* data;
   // The size of the data in bytes.
   size_t size;
@@ -271,6 +276,19 @@ LiteRtLmSession* litert_lm_engine_create_session(LiteRtLmEngine* engine,
 // @param session The session to destroy.
 LITERT_LM_C_API_EXPORT
 void litert_lm_session_delete(LiteRtLmSession* session);
+
+// Preprocesses raw audio bytes into a session-ready audio tensor for the
+// current session/model configuration. The returned handle can be passed as
+// `InputData.data` with type `kInputAudioPreprocessed`.
+LITERT_LM_C_API_EXPORT
+LiteRtLmPreprocessedAudio* litert_lm_session_preprocess_audio(
+    LiteRtLmSession* session, const void* audio_data, size_t audio_size);
+
+// Destroys a preprocessed audio handle created by
+// `litert_lm_session_preprocess_audio`.
+LITERT_LM_C_API_EXPORT
+void litert_lm_preprocessed_audio_delete(
+    LiteRtLmPreprocessedAudio* preprocessed_audio);
 
 // Generates content from the input prompt.
 //

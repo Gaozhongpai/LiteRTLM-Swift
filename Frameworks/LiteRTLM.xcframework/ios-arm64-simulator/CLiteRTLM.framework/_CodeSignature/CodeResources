@@ -6,7 +6,7 @@
 	<dict>
 		<key>Headers/engine.h</key>
 		<data>
-		YgNQHb3d5ZSMt+OArqkf2XKjFyA=
+		U46YOShXbZs2n1oQmRHRsTasUuM=
 		</data>
 		<key>Headers/litert_lm_logging.h</key>
 		<data>
@@ -20,6 +20,10 @@
 		<data>
 		V1NzPEqLrtyn3YcAATVkSgRbnMM=
 		</data>
+		<key>libGemmaModelConstraintProvider.dylib</key>
+		<data>
+		MoDyUbxWpN7588xWK9QogC9Sw2w=
+		</data>
 	</dict>
 	<key>files2</key>
 	<dict>
@@ -27,7 +31,7 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			ys7h0Yqp4sIq642i/BV2slwD1xBOUxmgNSxkpXu2kek=
+			rLfajZnMJoReOwoE99C62BgJmNeGytmZgDq1p8lre54=
 			</data>
 		</dict>
 		<key>Headers/litert_lm_logging.h</key>
@@ -42,6 +46,13 @@
 			<key>hash2</key>
 			<data>
 			6+p8hUMjrBlqco/tt8gCqzieXnRSsXGol/B0+UIIP+Y=
+			</data>
+		</dict>
+		<key>libGemmaModelConstraintProvider.dylib</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			5MxDs/JER/DjOll+s2oqn2H13U3oPahRCnDmLt3QSVg=
 			</data>
 		</dict>
 	</dict>

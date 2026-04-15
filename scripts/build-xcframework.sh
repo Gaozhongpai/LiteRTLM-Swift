@@ -74,7 +74,7 @@ info "Using $(xcodebuild -version | head -1)"
 info "Building for iOS device (arm64)..."
 cd "$LITERT_LM_DIR"
 
-$BAZEL_CMD build --config=ios_arm64 //c:libLiteRTLMEngine.dylib 2>&1 | tail -5
+$BAZEL_CMD build --config=ios_arm64 //c:libLiteRTLMEngine.dylib
 
 DEVICE_DYLIB="$LITERT_LM_DIR/bazel-bin/c/libLiteRTLMEngine.dylib"
 if [ ! -f "$DEVICE_DYLIB" ]; then
@@ -88,7 +88,7 @@ info "Device build OK: $(du -h "$DEVICE_DYLIB" | cut -f1)"
 
 info "Building for iOS simulator (arm64)..."
 
-$BAZEL_CMD build --config=ios_sim_arm64 //c:libLiteRTLMEngine.dylib 2>&1 | tail -5
+$BAZEL_CMD build --config=ios_sim_arm64 //c:libLiteRTLMEngine.dylib
 
 SIM_DYLIB="$LITERT_LM_DIR/bazel-bin/c/libLiteRTLMEngine.dylib"
 if [ ! -f "$SIM_DYLIB" ]; then
@@ -102,14 +102,29 @@ cp "$SIM_DYLIB" "$SIM_DYLIB_COPY"
 
 # Rebuild device to restore bazel-bin
 info "Restoring device build..."
-$BAZEL_CMD build --config=ios_arm64 //c:libLiteRTLMEngine.dylib 2>&1 | tail -3
+$BAZEL_CMD build --config=ios_arm64 //c:libLiteRTLMEngine.dylib
 DEVICE_DYLIB="$LITERT_LM_DIR/bazel-bin/c/libLiteRTLMEngine.dylib"
 
-# Also grab the GemmaModelConstraintProvider dylib if present
-CONSTRAINT_DYLIB=""
-if [ -f "$LITERT_LM_DIR/bazel-bin/c/libGemmaModelConstraintProvider.dylib" ]; then
-    CONSTRAINT_DYLIB="$LITERT_LM_DIR/bazel-bin/c/libGemmaModelConstraintProvider.dylib"
-    info "Found libGemmaModelConstraintProvider.dylib"
+# Also grab the GemmaModelConstraintProvider dylib if present.
+# Newer LiteRT-LM checkouts stage these in prebuilt/<platform>/ instead of
+# bazel-bin/c/.
+DEVICE_CONSTRAINT_DYLIB=""
+SIM_CONSTRAINT_DYLIB=""
+
+if [ -f "$LITERT_LM_DIR/prebuilt/ios_arm64/libGemmaModelConstraintProvider.dylib" ]; then
+    DEVICE_CONSTRAINT_DYLIB="$LITERT_LM_DIR/prebuilt/ios_arm64/libGemmaModelConstraintProvider.dylib"
+    info "Found device libGemmaModelConstraintProvider.dylib in prebuilt/ios_arm64"
+elif [ -f "$LITERT_LM_DIR/bazel-bin/c/libGemmaModelConstraintProvider.dylib" ]; then
+    DEVICE_CONSTRAINT_DYLIB="$LITERT_LM_DIR/bazel-bin/c/libGemmaModelConstraintProvider.dylib"
+    info "Found device libGemmaModelConstraintProvider.dylib in bazel-bin/c"
+fi
+
+if [ -f "$LITERT_LM_DIR/prebuilt/ios_sim_arm64/libGemmaModelConstraintProvider.dylib" ]; then
+    SIM_CONSTRAINT_DYLIB="$LITERT_LM_DIR/prebuilt/ios_sim_arm64/libGemmaModelConstraintProvider.dylib"
+    info "Found simulator libGemmaModelConstraintProvider.dylib in prebuilt/ios_sim_arm64"
+elif [ -f "$LITERT_LM_DIR/bazel-bin/c/libGemmaModelConstraintProvider.dylib" ]; then
+    SIM_CONSTRAINT_DYLIB="$LITERT_LM_DIR/bazel-bin/c/libGemmaModelConstraintProvider.dylib"
+    info "Found simulator libGemmaModelConstraintProvider.dylib in bazel-bin/c"
 fi
 
 # ---------------------------------------------------------------------------
@@ -186,10 +201,10 @@ PLIST
 }
 
 info "Packaging device framework..."
-package_framework "ios-arm64" "$DEVICE_DYLIB" "$CONSTRAINT_DYLIB"
+package_framework "ios-arm64" "$DEVICE_DYLIB" "$DEVICE_CONSTRAINT_DYLIB"
 
 info "Packaging simulator framework..."
-package_framework "ios-arm64-simulator" "$SIM_DYLIB_COPY" ""
+package_framework "ios-arm64-simulator" "$SIM_DYLIB_COPY" "$SIM_CONSTRAINT_DYLIB"
 
 # ---------------------------------------------------------------------------
 # 6. Create xcframework

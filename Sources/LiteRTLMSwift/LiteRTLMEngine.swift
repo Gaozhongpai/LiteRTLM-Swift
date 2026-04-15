@@ -42,10 +42,29 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     /// A piece of input for a persistent session turn.
     ///
     /// Use with `sessionGenerateStreaming(inputs:)` to send mixed text and audio
-    /// in a single user turn while reusing the session's KV cache.
+    /// in a single user turn while reusing the session's KV cache. For raw
+    /// audio bytes, prefer `sessionPreprocessAudio(_:)` and then pass the
+    /// result as `.preprocessedAudio(...)`.
     public enum SessionInput: Sendable {
         case text(String)
         case audio(Data)
+        case preprocessedAudio(SessionPreprocessedAudio)
+    }
+
+    /// A session-ready audio payload created by `sessionPreprocessAudio(_:)`.
+    ///
+    /// This is tied to the current persistent session's model configuration and
+    /// can be reused in `sessionGenerateStreaming(inputs:)`.
+    public final class SessionPreprocessedAudio: @unchecked Sendable {
+        fileprivate let handle: OpaquePointer
+
+        fileprivate init(handle: OpaquePointer) {
+            self.handle = handle
+        }
+
+        deinit {
+            litert_lm_preprocessed_audio_delete(handle)
+        }
     }
 
     // MARK: - Properties
@@ -738,14 +757,15 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     /// Stream text from a persistent session turn with mixed text and audio inputs.
     ///
     /// The session's KV cache already holds all previous context. This method
-    /// processes the inputs in order — audio bytes are encoded via the audio
-    /// backend — and streams the model's response.
+    /// processes the inputs in order. Raw `.audio(Data)` is passed through to
+    /// the underlying session API, while `.preprocessedAudio(...)` uses audio
+    /// prepared by `sessionPreprocessAudio(_:)`.
     ///
     /// Example for a user turn containing audio + text prompt:
     /// ```swift
     /// let stream = engine.sessionGenerateStreaming(inputs: [
     ///     .text("<|turn>user\n"),
-    ///     .audio(wavData),
+    ///     .preprocessedAudio(processedAudio),
     ///     .text("\nDescribe the audio.\n<turn|>\n<|turn>model\n")
     /// ])
     /// ```
@@ -760,16 +780,24 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                     return
                 }
 
-                // Flatten SessionInput into (type, Data) pairs.
-                // Audio entries expand to [kInputAudio, kInputAudioEnd].
-                var inputEntries: [(InputDataType, Data)] = []
+                enum FlattenedInput {
+                    case text(Data)
+                    case rawAudio(Data)
+                    case audioEnd
+                    case preprocessedAudio(SessionPreprocessedAudio)
+                }
+
+                var inputEntries: [FlattenedInput] = []
                 for item in inputs {
                     switch item {
                     case .text(let string):
-                        inputEntries.append((kInputText, Data(string.utf8)))
+                        inputEntries.append(.text(Data(string.utf8)))
                     case .audio(let data):
-                        inputEntries.append((kInputAudio, data))
-                        inputEntries.append((kInputAudioEnd, Data()))
+                        inputEntries.append(.rawAudio(data))
+                        inputEntries.append(.audioEnd)
+                    case .preprocessedAudio(let processed):
+                        inputEntries.append(.preprocessedAudio(processed))
+                        inputEntries.append(.audioEnd)
                     }
                 }
 
@@ -782,65 +810,77 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                 var cInputs: [InputData] = []
                 cInputs.reserveCapacity(inputEntries.count)
                 var pinnedBuffers: [NSData] = []
-                for (type, data) in inputEntries {
-                    if type == kInputText {
+                var pinnedPreprocessedAudio: [SessionPreprocessedAudio] = []
+                for entry in inputEntries {
+                    switch entry {
+                    case .text(let data):
                         var nullTerminated = data
                         nullTerminated.append(0)
                         let nsData = nullTerminated as NSData
                         pinnedBuffers.append(nsData)
                         cInputs.append(InputData(
-                            type: type,
+                            type: kInputText,
                             data: nsData.bytes,
                             size: nsData.length - 1
                         ))
-                    } else if type == kInputAudioEnd {
-                        cInputs.append(InputData(type: type, data: nil, size: 0))
-                    } else {
+                    case .rawAudio(let data):
                         let nsData = data as NSData
                         pinnedBuffers.append(nsData)
                         cInputs.append(InputData(
-                            type: type,
+                            type: kInputAudio,
                             data: data.isEmpty ? nil : nsData.bytes,
                             size: nsData.length
+                        ))
+                    case .audioEnd:
+                        cInputs.append(InputData(type: kInputAudioEnd, data: nil, size: 0))
+                    case .preprocessedAudio(let processed):
+                        pinnedPreprocessedAudio.append(processed)
+                        cInputs.append(InputData(
+                            type: kInputAudioPreprocessed,
+                            data: UnsafeRawPointer(processed.handle),
+                            size: 0
                         ))
                     }
                 }
 
-                // Keep NSData buffers alive while the C API reads input data.
+                // Keep buffers and opaque preprocessed handles alive while the
+                // C API reads input data.
                 let callResult = withExtendedLifetime(pinnedBuffers) {
-                    cInputs.withUnsafeMutableBufferPointer { bufferPtr -> Int32 in
-                        guard let baseAddress = bufferPtr.baseAddress else { return -1 }
-                        return litert_lm_session_generate_content_stream(
-                            session, baseAddress, bufferPtr.count,
-                            { callbackData, chunk, isFinal, errorMsg in
-                                guard let cbData = callbackData else { return }
-                                let st = Unmanaged<StreamCallbackState>.fromOpaque(cbData)
-                                    .takeUnretainedValue()
+                    withExtendedLifetime(pinnedPreprocessedAudio) {
+                        cInputs.withUnsafeMutableBufferPointer { bufferPtr -> Int32 in
+                            guard let baseAddress = bufferPtr.baseAddress else { return -1 }
+                            return litert_lm_session_generate_content_stream(
+                                session, baseAddress, bufferPtr.count,
+                                { callbackData, chunk, isFinal, errorMsg in
+                                    guard let cbData = callbackData else { return }
+                                    let st = Unmanaged<StreamCallbackState>.fromOpaque(cbData)
+                                        .takeUnretainedValue()
 
-                                let errorMessage: String? = {
-                                    guard let errorMsg else { return nil }
-                                    let msg = String(cString: errorMsg)
-                                    return msg.isEmpty ? nil : msg
-                                }()
+                                    let errorMessage: String? = {
+                                        guard let errorMsg else { return nil }
+                                        let msg = String(cString: errorMsg)
+                                        return msg.isEmpty ? nil : msg
+                                    }()
 
-                                if let chunk, errorMessage == nil {
-                                    let text = String(cString: chunk)
-                                    if !text.isEmpty { st.continuation.yield(text) }
-                                }
-
-                                if isFinal || errorMessage != nil {
-                                    if let error = errorMessage {
-                                        st.continuation.finish(throwing: LiteRTLMError.inferenceFailure(error))
-                                    } else {
-                                        st.continuation.finish()
+                                    if let chunk, errorMessage == nil {
+                                        let text = String(cString: chunk)
+                                        if !text.isEmpty { st.continuation.yield(text) }
                                     }
-                                    let semaphore = st.doneSemaphore
-                                    Unmanaged<StreamCallbackState>.fromOpaque(cbData).release()
-                                    semaphore.signal()
-                                }
-                            },
-                            statePtr
-                        )
+
+                                    if isFinal || errorMessage != nil {
+                                        if let error = errorMessage {
+                                            st.continuation.finish(throwing: LiteRTLMError.inferenceFailure(error))
+                                        } else {
+                                            st.continuation.finish()
+                                        }
+                                        let semaphore = st.doneSemaphore
+                                        Unmanaged<StreamCallbackState>.fromOpaque(cbData).release()
+                                        semaphore.signal()
+                                    }
+                                },
+                                statePtr
+                            )
+                        }
                     }
                 }
 
@@ -852,6 +892,38 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
                 streamDone.wait()
                 self.logSessionBenchmark(session)
+            }
+        }
+    }
+
+    /// Preprocess raw audio bytes into a session-ready payload for mixed
+    /// text+audio turns sent via `sessionGenerateStreaming(inputs:)`.
+    ///
+    /// Call this after `openSession()` and before constructing the turn inputs.
+    public func sessionPreprocessAudio(_ audioData: Data) async throws -> SessionPreprocessedAudio {
+        try ensureReady()
+        guard !audioData.isEmpty else {
+            throw LiteRTLMError.inferenceFailure("No audio data provided")
+        }
+
+        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<SessionPreprocessedAudio, Error>) in
+            inferenceQueue.async { [self] in
+                guard let session = self.chatSession else {
+                    cont.resume(throwing: LiteRTLMError.inferenceFailure("No persistent session open — call openSession() first"))
+                    return
+                }
+
+                let handle: OpaquePointer? = audioData.withUnsafeBytes { rawBuffer in
+                    guard let baseAddress = rawBuffer.baseAddress else { return nil }
+                    return litert_lm_session_preprocess_audio(session, baseAddress, rawBuffer.count)
+                }
+
+                guard let handle else {
+                    cont.resume(throwing: LiteRTLMError.inferenceFailure("Failed to preprocess session audio"))
+                    return
+                }
+
+                cont.resume(returning: SessionPreprocessedAudio(handle: handle))
             }
         }
     }
