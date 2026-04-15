@@ -39,6 +39,15 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         case error(String)
     }
 
+    /// A piece of input for a persistent session turn.
+    ///
+    /// Use with `sessionGenerateStreaming(inputs:)` to send mixed text and audio
+    /// in a single user turn while reusing the session's KV cache.
+    public enum SessionInput: Sendable {
+        case text(String)
+        case audio(Data)
+    }
+
     // MARK: - Properties
 
     public private(set) var status: Status = .notLoaded
@@ -673,6 +682,127 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                 if result != 0 {
                     Unmanaged<StreamCallbackState>.fromOpaque(statePtr).release()
                     continuation.finish(throwing: LiteRTLMError.inferenceFailure("Failed to start stream"))
+                    return
+                }
+
+                streamDone.wait()
+                self.logSessionBenchmark(session)
+            }
+        }
+    }
+
+    /// Stream text from a persistent session turn with mixed text and audio inputs.
+    ///
+    /// The session's KV cache already holds all previous context. This method
+    /// processes the inputs in order — audio bytes are encoded via the audio
+    /// backend — and streams the model's response.
+    ///
+    /// Example for a user turn containing audio + text prompt:
+    /// ```swift
+    /// let stream = engine.sessionGenerateStreaming(inputs: [
+    ///     .text("<|turn>user\n"),
+    ///     .audio(wavData),
+    ///     .text("\nDescribe the audio.\n<turn|>\n<|turn>model\n")
+    /// ])
+    /// ```
+    ///
+    /// - Parameter inputs: Ordered array of text and audio inputs for this turn.
+    /// - Returns: An `AsyncThrowingStream` yielding text chunks.
+    public func sessionGenerateStreaming(inputs: [SessionInput]) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
+            self.inferenceQueue.async { [self] in
+                guard let session = self.chatSession else {
+                    continuation.finish(throwing: LiteRTLMError.inferenceFailure("No persistent session open — call openSession() first"))
+                    return
+                }
+
+                // Flatten SessionInput into (type, Data) pairs.
+                // Audio entries expand to [kInputAudio, kInputAudioEnd].
+                var inputEntries: [(InputDataType, Data)] = []
+                for item in inputs {
+                    switch item {
+                    case .text(let string):
+                        inputEntries.append((kInputText, Data(string.utf8)))
+                    case .audio(let data):
+                        inputEntries.append((kInputAudio, data))
+                        inputEntries.append((kInputAudioEnd, Data()))
+                    }
+                }
+
+                let streamDone = DispatchSemaphore(value: 0)
+                let state = StreamCallbackState(continuation: continuation, doneSemaphore: streamDone)
+                let statePtr = Unmanaged.passRetained(state).toOpaque()
+
+                // Build C InputData structs. NSData gives stable .bytes pointers
+                // that remain valid as long as the NSData objects are alive.
+                var cInputs: [InputData] = []
+                cInputs.reserveCapacity(inputEntries.count)
+                var pinnedBuffers: [NSData] = []
+                for (type, data) in inputEntries {
+                    if type == kInputText {
+                        var nullTerminated = data
+                        nullTerminated.append(0)
+                        let nsData = nullTerminated as NSData
+                        pinnedBuffers.append(nsData)
+                        cInputs.append(InputData(
+                            type: type,
+                            data: nsData.bytes,
+                            size: nsData.length - 1
+                        ))
+                    } else if type == kInputAudioEnd {
+                        cInputs.append(InputData(type: type, data: nil, size: 0))
+                    } else {
+                        let nsData = data as NSData
+                        pinnedBuffers.append(nsData)
+                        cInputs.append(InputData(
+                            type: type,
+                            data: data.isEmpty ? nil : nsData.bytes,
+                            size: nsData.length
+                        ))
+                    }
+                }
+
+                // Keep NSData buffers alive while the C API reads input data.
+                let callResult = withExtendedLifetime(pinnedBuffers) {
+                    cInputs.withUnsafeMutableBufferPointer { bufferPtr -> Int32 in
+                        guard let baseAddress = bufferPtr.baseAddress else { return -1 }
+                        return litert_lm_session_generate_content_stream(
+                            session, baseAddress, bufferPtr.count,
+                            { callbackData, chunk, isFinal, errorMsg in
+                                guard let cbData = callbackData else { return }
+                                let st = Unmanaged<StreamCallbackState>.fromOpaque(cbData)
+                                    .takeUnretainedValue()
+
+                                let errorMessage: String? = {
+                                    guard let errorMsg else { return nil }
+                                    let msg = String(cString: errorMsg)
+                                    return msg.isEmpty ? nil : msg
+                                }()
+
+                                if let chunk, errorMessage == nil {
+                                    let text = String(cString: chunk)
+                                    if !text.isEmpty { st.continuation.yield(text) }
+                                }
+
+                                if isFinal || errorMessage != nil {
+                                    if let error = errorMessage {
+                                        st.continuation.finish(throwing: LiteRTLMError.inferenceFailure(error))
+                                    } else {
+                                        st.continuation.finish()
+                                    }
+                                    let semaphore = st.doneSemaphore
+                                    Unmanaged<StreamCallbackState>.fromOpaque(cbData).release()
+                                    semaphore.signal()
+                                }
+                            },
+                            statePtr
+                        )
+                    }
+                }
+
+                if callResult != 0 {
+                    Unmanaged<StreamCallbackState>.fromOpaque(statePtr).release()
+                    continuation.finish(throwing: LiteRTLMError.inferenceFailure("Failed to start multimodal stream"))
                     return
                 }
 
