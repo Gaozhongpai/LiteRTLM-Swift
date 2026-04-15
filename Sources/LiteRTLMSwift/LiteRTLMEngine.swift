@@ -598,6 +598,18 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         return try await sendPersistentConversationMessage(messageJSON: messageJSON)
     }
 
+    /// Stream a text message through the persistent Conversation.
+    ///
+    /// The Conversation's KV cache holds all previous context. Each call appends
+    /// a user turn and streams the model's response incrementally.
+    ///
+    /// - Parameter text: The user's text message.
+    /// - Returns: An `AsyncThrowingStream` yielding response text chunks.
+    public func conversationSendTextStreaming(_ text: String) -> AsyncThrowingStream<String, Error> {
+        let messageJSON = Self.buildTextMessageJSON(text: text)
+        return streamPersistentConversationMessage(messageJSON: messageJSON)
+    }
+
     public func conversationSendAudio(
         audioData: Data,
         prompt: String,
@@ -616,6 +628,38 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             text: prompt
         )
         return try await sendPersistentConversationMessage(
+            messageJSON: messageJSON,
+            tempURLs: [tempURL]
+        )
+    }
+
+    /// Stream an audio message through the persistent Conversation.
+    ///
+    /// The Conversation handles audio decoding and preprocessing internally.
+    /// Its KV cache holds all previous context (text and audio turns).
+    ///
+    /// - Parameters:
+    ///   - audioData: Raw audio bytes (WAV, FLAC, or MP3).
+    ///   - prompt: Text prompt accompanying the audio.
+    ///   - format: Audio container format. Default `.wav`.
+    /// - Returns: An `AsyncThrowingStream` yielding response text chunks.
+    public func conversationSendAudioStreaming(
+        audioData: Data,
+        prompt: String,
+        format: AudioFormat = .wav
+    ) throws -> AsyncThrowingStream<String, Error> {
+        guard !audioData.isEmpty else {
+            throw LiteRTLMError.inferenceFailure("No audio data provided")
+        }
+
+        let tempURL = Self.makeTempURL(extension: format.rawValue)
+        try audioData.write(to: tempURL)
+        let messageJSON = Self.buildMultimodalMessageJSON(
+            audioPaths: [tempURL.path],
+            imagePaths: [],
+            text: prompt
+        )
+        return streamPersistentConversationMessage(
             messageJSON: messageJSON,
             tempURLs: [tempURL]
         )
@@ -1220,6 +1264,75 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                 } catch {
                     continuation.resume(throwing: error)
                 }
+            }
+        }
+    }
+
+    /// Streaming counterpart of `sendPersistentConversationMessage`.
+    ///
+    /// Uses `litert_lm_conversation_send_message_stream` to yield tokens
+    /// incrementally instead of blocking for the full response.
+    private func streamPersistentConversationMessage(
+        messageJSON: String,
+        tempURLs: [URL] = []
+    ) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
+            self.inferenceQueue.async { [self] in
+                let urlsToCleanup = tempURLs
+                guard let conversation = self.chatConversation else {
+                    Self.cleanupTempFiles(urlsToCleanup)
+                    continuation.finish(throwing: LiteRTLMError.inferenceFailure("No persistent conversation open — call openConversation() first"))
+                    return
+                }
+
+                let streamDone = DispatchSemaphore(value: 0)
+                let state = StreamCallbackState(continuation: continuation, doneSemaphore: streamDone)
+                let statePtr = Unmanaged.passRetained(state).toOpaque()
+
+                let callResult = messageJSON.withCString { msgPtr -> Int32 in
+                    litert_lm_conversation_send_message_stream(
+                        conversation, msgPtr, nil,
+                        { callbackData, chunk, isFinal, errorMsg in
+                            guard let cbData = callbackData else { return }
+                            let st = Unmanaged<StreamCallbackState>.fromOpaque(cbData)
+                                .takeUnretainedValue()
+
+                            let errorMessage: String? = {
+                                guard let errorMsg else { return nil }
+                                let msg = String(cString: errorMsg)
+                                return msg.isEmpty ? nil : msg
+                            }()
+
+                            if let chunk, errorMessage == nil {
+                                let text = String(cString: chunk)
+                                if !text.isEmpty { st.continuation.yield(text) }
+                            }
+
+                            if isFinal || errorMessage != nil {
+                                if let error = errorMessage {
+                                    st.continuation.finish(throwing: LiteRTLMError.inferenceFailure(error))
+                                } else {
+                                    st.continuation.finish()
+                                }
+                                let semaphore = st.doneSemaphore
+                                Unmanaged<StreamCallbackState>.fromOpaque(cbData).release()
+                                semaphore.signal()
+                            }
+                        },
+                        statePtr
+                    )
+                }
+
+                if callResult != 0 {
+                    Unmanaged<StreamCallbackState>.fromOpaque(statePtr).release()
+                    Self.cleanupTempFiles(urlsToCleanup)
+                    continuation.finish(throwing: LiteRTLMError.inferenceFailure("Failed to start conversation stream"))
+                    return
+                }
+
+                streamDone.wait()
+                Self.cleanupTempFiles(urlsToCleanup)
+                self.logConversationBenchmark(conversation)
             }
         }
     }
