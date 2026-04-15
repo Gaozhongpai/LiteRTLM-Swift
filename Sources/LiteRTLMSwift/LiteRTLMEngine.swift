@@ -1304,7 +1304,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                             }()
 
                             if let chunk, errorMessage == nil {
-                                let text = String(cString: chunk)
+                                let raw = String(cString: chunk)
+                                let text = LiteRTLMEngine.extractTextFromConversationResponse(raw)
                                 if !text.isEmpty { st.continuation.yield(text) }
                             }
 
