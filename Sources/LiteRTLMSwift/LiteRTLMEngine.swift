@@ -69,11 +69,15 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         let eng = engine
         let ses = chatSession
         let sesCfg = chatSessionConfig
+        let conv = chatConversation
+        let convCfg = chatConversationConfig
         let queue = inferenceQueue
-        if eng != nil || ses != nil {
+        if eng != nil || ses != nil || conv != nil {
             queue.async {
                 if let s = ses { litert_lm_session_delete(s) }
                 if let c = sesCfg { litert_lm_session_config_delete(c) }
+                if let c = conv { litert_lm_conversation_delete(c) }
+                if let c = convCfg { litert_lm_conversation_config_delete(c) }
                 if let e = eng { litert_lm_engine_delete(e) }
             }
         }
@@ -159,6 +163,14 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             if let c = chatSessionConfig {
                 litert_lm_session_config_delete(c)
                 chatSessionConfig = nil
+            }
+            if let c = chatConversation {
+                litert_lm_conversation_delete(c)
+                chatConversation = nil
+            }
+            if let c = chatConversationConfig {
+                litert_lm_conversation_config_delete(c)
+                chatConversationConfig = nil
             }
             if let eng = engine { litert_lm_engine_delete(eng) }
             engine = nil
@@ -419,6 +431,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
     private var chatSession: OpaquePointer?
     private var chatSessionConfig: OpaquePointer?
+    private var chatConversation: OpaquePointer?
+    private var chatConversationConfig: OpaquePointer?
 
     /// Open a persistent session for multi-turn generation with KV cache reuse.
     ///
@@ -433,6 +447,14 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             inferenceQueue.async { [self] in
                 do {
+                    if let c = chatConversation {
+                        litert_lm_conversation_delete(c)
+                        chatConversation = nil
+                    }
+                    if let c = chatConversationConfig {
+                        litert_lm_conversation_config_delete(c)
+                        chatConversationConfig = nil
+                    }
                     if let s = chatSession {
                         litert_lm_session_delete(s)
                         chatSession = nil
@@ -472,6 +494,122 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             }
             Self.log.info("Persistent session closed")
         }
+    }
+
+    // MARK: - Persistent Conversation (Multi-turn Multimodal)
+
+    /// Open a persistent Conversation for multi-turn text and multimodal turns.
+    ///
+    /// Unlike the Session API, the Conversation API natively tracks history and
+    /// supports text, image, and audio user turns in the same ongoing stateful
+    /// interaction. `historyJSON`, when provided, should be a JSON array of prior
+    /// messages using LiteRT-LM's Conversation message format.
+    public func openConversation(
+        systemPrompt: String? = nil,
+        historyJSON: String? = nil,
+        temperature: Float = 0.3,
+        maxTokens: Int = 512
+    ) async throws {
+        try ensureReady()
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            inferenceQueue.async { [self] in
+                do {
+                    if let s = chatSession {
+                        litert_lm_session_delete(s)
+                        chatSession = nil
+                    }
+                    if let c = chatSessionConfig {
+                        litert_lm_session_config_delete(c)
+                        chatSessionConfig = nil
+                    }
+                    if let c = chatConversation {
+                        litert_lm_conversation_delete(c)
+                        chatConversation = nil
+                    }
+                    if let c = chatConversationConfig {
+                        litert_lm_conversation_config_delete(c)
+                        chatConversationConfig = nil
+                    }
+
+                    guard let eng = engine else { throw LiteRTLMError.modelNotLoaded }
+                    let sessionConfig = try createSessionConfig(
+                        temperature: temperature,
+                        maxTokens: Int32(maxTokens)
+                    )
+                    guard let conversationConfig = createConversationConfig(
+                        engine: eng,
+                        sessionConfig: sessionConfig,
+                        systemPrompt: systemPrompt,
+                        historyJSON: historyJSON
+                    ) else {
+                        litert_lm_session_config_delete(sessionConfig)
+                        throw LiteRTLMError.inferenceFailure("Failed to create persistent conversation config")
+                    }
+                    guard let conversation = litert_lm_conversation_create(eng, conversationConfig) else {
+                        litert_lm_conversation_config_delete(conversationConfig)
+                        litert_lm_session_config_delete(sessionConfig)
+                        throw LiteRTLMError.inferenceFailure("Failed to create persistent conversation")
+                    }
+
+                    chatSessionConfig = sessionConfig
+                    chatConversationConfig = conversationConfig
+                    chatConversation = conversation
+                    Self.log.info("Persistent conversation opened")
+                    cont.resume()
+                } catch {
+                    cont.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// Close the persistent Conversation and release its underlying state.
+    public func closeConversation() {
+        inferenceQueue.async { [self] in
+            if let c = chatConversation {
+                logConversationBenchmark(c)
+                litert_lm_conversation_delete(c)
+                chatConversation = nil
+            }
+            if let c = chatConversationConfig {
+                litert_lm_conversation_config_delete(c)
+                chatConversationConfig = nil
+            }
+            if let c = chatSessionConfig {
+                litert_lm_session_config_delete(c)
+                chatSessionConfig = nil
+            }
+            Self.log.info("Persistent conversation closed")
+        }
+    }
+
+    public func conversationSendText(_ text: String) async throws -> String {
+        try ensureReady()
+        let messageJSON = Self.buildTextMessageJSON(text: text)
+        return try await sendPersistentConversationMessage(messageJSON: messageJSON)
+    }
+
+    public func conversationSendAudio(
+        audioData: Data,
+        prompt: String,
+        format: AudioFormat = .wav
+    ) async throws -> String {
+        try ensureReady()
+        guard !audioData.isEmpty else {
+            throw LiteRTLMError.inferenceFailure("No audio data provided")
+        }
+
+        let tempURL = Self.makeTempURL(extension: format.rawValue)
+        try audioData.write(to: tempURL)
+        let messageJSON = Self.buildMultimodalMessageJSON(
+            audioPaths: [tempURL.path],
+            imagePaths: [],
+            text: prompt
+        )
+        return try await sendPersistentConversationMessage(
+            messageJSON: messageJSON,
+            tempURLs: [tempURL]
+        )
     }
 
     /// Stream text using the persistent session.
@@ -722,6 +860,23 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         temperature: Float,
         maxTokens: Int32
     ) throws -> (session: OpaquePointer, config: OpaquePointer) {
+        let sessionConfig = try createSessionConfig(
+            temperature: temperature,
+            maxTokens: maxTokens
+        )
+
+        guard let session = litert_lm_engine_create_session(eng, sessionConfig) else {
+            litert_lm_session_config_delete(sessionConfig)
+            throw LiteRTLMError.inferenceFailure("Failed to create session")
+        }
+
+        return (session, sessionConfig)
+    }
+
+    private func createSessionConfig(
+        temperature: Float,
+        maxTokens: Int32
+    ) throws -> OpaquePointer {
         guard let sessionConfig = litert_lm_session_config_create() else {
             throw LiteRTLMError.inferenceFailure("Failed to create session config")
         }
@@ -732,13 +887,53 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             temperature: temperature, seed: 0
         )
         litert_lm_session_config_set_sampler_params(sessionConfig, &samplerParams)
+        return sessionConfig
+    }
 
-        guard let session = litert_lm_engine_create_session(eng, sessionConfig) else {
-            litert_lm_session_config_delete(sessionConfig)
-            throw LiteRTLMError.inferenceFailure("Failed to create session")
-        }
+    private func createConversationConfig(
+        engine eng: OpaquePointer,
+        sessionConfig: OpaquePointer,
+        systemPrompt: String?,
+        historyJSON: String?
+    ) -> OpaquePointer? {
+        let systemContent = systemPrompt?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let historyContent = historyJSON?.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        return (session, sessionConfig)
+        return systemContent?.withCString { systemPtr in
+            historyContent?.withCString { historyPtr in
+                litert_lm_conversation_config_create(
+                    eng,
+                    sessionConfig,
+                    systemPtr,
+                    nil,
+                    historyPtr,
+                    false
+                )
+            } ?? litert_lm_conversation_config_create(
+                eng,
+                sessionConfig,
+                systemPtr,
+                nil,
+                nil,
+                false
+            )
+        } ?? historyContent?.withCString { historyPtr in
+            litert_lm_conversation_config_create(
+                eng,
+                sessionConfig,
+                nil,
+                nil,
+                historyPtr,
+                false
+            )
+        } ?? litert_lm_conversation_config_create(
+            eng,
+            sessionConfig,
+            nil,
+            nil,
+            nil,
+            false
+        )
     }
 
     private func extractResponseText(_ responses: OpaquePointer) -> String? {
@@ -760,6 +955,29 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         let numPrefill = litert_lm_benchmark_info_get_num_prefill_turns(info)
 
         Self.log.info("Benchmark: init=\(String(format: "%.2f", initTime))s, TTFT=\(String(format: "%.2f", ttft))s")
+
+        for i in 0..<numPrefill {
+            let tps = litert_lm_benchmark_info_get_prefill_tokens_per_sec_at(info, Int32(i))
+            let count = litert_lm_benchmark_info_get_prefill_token_count_at(info, Int32(i))
+            Self.log.info("  Prefill[\(i)]: \(count) tokens @ \(String(format: "%.1f", tps)) tok/s")
+        }
+        for i in 0..<numDecode {
+            let tps = litert_lm_benchmark_info_get_decode_tokens_per_sec_at(info, Int32(i))
+            let count = litert_lm_benchmark_info_get_decode_token_count_at(info, Int32(i))
+            Self.log.info("  Decode[\(i)]: \(count) tokens @ \(String(format: "%.1f", tps)) tok/s")
+        }
+    }
+
+    private func logConversationBenchmark(_ conversation: OpaquePointer) {
+        guard let info = litert_lm_conversation_get_benchmark_info(conversation) else { return }
+        defer { litert_lm_benchmark_info_delete(info) }
+
+        let initTime = litert_lm_benchmark_info_get_total_init_time_in_second(info)
+        let ttft = litert_lm_benchmark_info_get_time_to_first_token(info)
+        let numDecode = litert_lm_benchmark_info_get_num_decode_turns(info)
+        let numPrefill = litert_lm_benchmark_info_get_num_prefill_turns(info)
+
+        Self.log.info("Conversation benchmark: init=\(String(format: "%.2f", initTime))s, TTFT=\(String(format: "%.2f", ttft))s")
 
         for i in 0..<numPrefill {
             let tps = litert_lm_benchmark_info_get_prefill_tokens_per_sec_at(info, Int32(i))
@@ -834,6 +1052,40 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                     }
 
                     let result = Self.extractTextFromConversationResponse(String(cString: responsePtr))
+                    continuation.resume(returning: result)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    private func sendPersistentConversationMessage(
+        messageJSON: String,
+        tempURLs: [URL] = []
+    ) async throws -> String {
+        let urlsToCleanup = tempURLs
+        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, any Error>) in
+            self.inferenceQueue.async { [self, urlsToCleanup] in
+                defer { Self.cleanupTempFiles(urlsToCleanup) }
+                do {
+                    guard let conversation = self.chatConversation else {
+                        throw LiteRTLMError.inferenceFailure("No persistent conversation open — call openConversation() first")
+                    }
+
+                    guard let response = messageJSON.withCString({ msgPtr in
+                        litert_lm_conversation_send_message(conversation, msgPtr, nil)
+                    }) else {
+                        throw LiteRTLMError.inferenceFailure("Persistent conversation returned no response")
+                    }
+                    defer { litert_lm_json_response_delete(response) }
+
+                    guard let responsePtr = litert_lm_json_response_get_string(response) else {
+                        throw LiteRTLMError.inferenceFailure("Persistent conversation response string is NULL")
+                    }
+
+                    let result = Self.extractTextFromConversationResponse(String(cString: responsePtr))
+                    self.logConversationBenchmark(conversation)
                     continuation.resume(returning: result)
                 } catch {
                     continuation.resume(throwing: error)
@@ -925,6 +1177,15 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             let fallback: [String: Any] = ["role": "user", "content": [["type": "text", "text": text]]]
             let fallbackData = (try? JSONSerialization.data(withJSONObject: fallback)) ?? Data()
             return String(data: fallbackData, encoding: .utf8) ?? "{}"
+        }
+        return jsonString
+    }
+
+    nonisolated static func buildTextMessageJSON(text: String) -> String {
+        let message: [String: Any] = ["role": "user", "content": text]
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: message),
+              let jsonString = String(data: jsonData, encoding: .utf8) else {
+            return #"{"role":"user","content":""}"#
         }
         return jsonString
     }
