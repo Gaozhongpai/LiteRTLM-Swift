@@ -544,6 +544,47 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         }
     }
 
+    /// Prefill the persistent session without requesting a new model response.
+    ///
+    /// Use this to seed KV cache with system prompt and prior turns before the
+    /// user sends the next message. The input should end on a closed turn marker
+    /// and should not include a trailing `<|turn>model` opener.
+    ///
+    /// - Parameter input: Text to add to session context.
+    public func sessionPrefill(input: String) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            self.inferenceQueue.async { [self] in
+                do {
+                    guard let session = self.chatSession else {
+                        throw LiteRTLMError.inferenceFailure("No persistent session open — call openSession() first")
+                    }
+
+                    let result = input.withCString { textPtr -> Bool in
+                        var inputData = InputData(
+                            type: kInputText,
+                            data: UnsafeRawPointer(textPtr),
+                            size: strlen(textPtr)
+                        )
+                        guard let responses = litert_lm_session_generate_content(session, &inputData, 1) else {
+                            return false
+                        }
+                        defer { litert_lm_responses_delete(responses) }
+                        return true
+                    }
+
+                    guard result else {
+                        throw LiteRTLMError.inferenceFailure("Failed to prefill session")
+                    }
+
+                    self.logSessionBenchmark(session)
+                    continuation.resume()
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
     // MARK: - Private: Session-based Inference
 
     private func runSessionInference(
