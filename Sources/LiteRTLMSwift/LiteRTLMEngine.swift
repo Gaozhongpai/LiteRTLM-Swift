@@ -535,6 +535,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     public func openConversation(
         systemPrompt: String? = nil,
         historyJSON: String? = nil,
+        tools: [ToolDeclaration] = [],
         temperature: Float = 0.3,
         maxTokens: Int = 512
     ) async throws {
@@ -564,10 +565,12 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                         temperature: temperature,
                         maxTokens: Int32(maxTokens)
                     )
+                    let toolsJSON = Self.buildToolsJSON(tools)
                     guard let conversationConfig = createConversationConfig(
                         engine: eng,
                         sessionConfig: sessionConfig,
                         systemPrompt: systemPrompt,
+                        toolsJSON: toolsJSON,
                         historyJSON: historyJSON
                     ) else {
                         litert_lm_session_config_delete(sessionConfig)
@@ -615,6 +618,31 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         try ensureReady()
         let messageJSON = Self.buildTextMessageJSON(text: text)
         return try await sendPersistentConversationMessage(messageJSON: messageJSON)
+    }
+
+    /// Send a user text message through a tool-enabled conversation and
+    /// receive either natural-language text or a batch of tool calls.
+    ///
+    /// Prerequisites: the conversation was opened with `tools:` non-empty.
+    /// Non-streaming: tool calls arrive in a single JSON object after the
+    /// model finishes generating the turn.
+    public func conversationSendTextWithTools(_ text: String) async throws -> ConversationTurn {
+        try ensureReady()
+        let messageJSON = Self.buildTextMessageJSON(text: text)
+        let raw = try await sendPersistentConversationMessageRaw(messageJSON: messageJSON)
+        return Self.parseConversationTurn(raw)
+    }
+
+    /// Send the results of a batch of tool calls back into the conversation
+    /// and receive the model's next turn.
+    ///
+    /// Results are sent in positional order — the runtime does not correlate
+    /// by id. The response may be another tool-call batch or final text.
+    public func conversationSendToolResults(_ results: [ToolResult]) async throws -> ConversationTurn {
+        try ensureReady()
+        let messageJSON = Self.buildToolResultsMessageJSON(results)
+        let raw = try await sendPersistentConversationMessageRaw(messageJSON: messageJSON)
+        return Self.parseConversationTurn(raw)
     }
 
     /// Stream a text message through the persistent Conversation.
@@ -1140,46 +1168,37 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         engine eng: OpaquePointer,
         sessionConfig: OpaquePointer,
         systemPrompt: String?,
+        toolsJSON: String?,
         historyJSON: String?
     ) -> OpaquePointer? {
         let systemContent = systemPrompt?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let toolsContent = toolsJSON?.trimmingCharacters(in: .whitespacesAndNewlines)
         let historyContent = historyJSON?.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        return systemContent?.withCString { systemPtr in
-            historyContent?.withCString { historyPtr in
-                litert_lm_conversation_config_create(
-                    eng,
-                    sessionConfig,
-                    systemPtr,
-                    nil,
-                    historyPtr,
-                    false
-                )
-            } ?? litert_lm_conversation_config_create(
-                eng,
-                sessionConfig,
-                systemPtr,
-                nil,
-                nil,
-                false
-            )
-        } ?? historyContent?.withCString { historyPtr in
-            litert_lm_conversation_config_create(
-                eng,
-                sessionConfig,
-                nil,
-                nil,
-                historyPtr,
-                false
-            )
-        } ?? litert_lm_conversation_config_create(
-            eng,
-            sessionConfig,
-            nil,
-            nil,
-            nil,
-            false
-        )
+        return Self.withOptionalCString(systemContent) { systemPtr in
+            Self.withOptionalCString(toolsContent) { toolsPtr in
+                Self.withOptionalCString(historyContent) { historyPtr in
+                    litert_lm_conversation_config_create(
+                        eng,
+                        sessionConfig,
+                        systemPtr,
+                        toolsPtr,
+                        historyPtr,
+                        false
+                    )
+                }
+            }
+        }
+    }
+
+    private nonisolated static func withOptionalCString<T>(
+        _ value: String?,
+        _ body: (UnsafePointer<CChar>?) -> T
+    ) -> T {
+        if let value {
+            return value.withCString { body($0) }
+        }
+        return body(nil)
     }
 
     private func extractResponseText(_ responses: OpaquePointer) -> String? {
@@ -1310,6 +1329,20 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         messageJSON: String,
         tempURLs: [URL] = []
     ) async throws -> String {
+        let raw = try await sendPersistentConversationMessageRaw(
+            messageJSON: messageJSON,
+            tempURLs: tempURLs
+        )
+        return Self.extractTextFromConversationResponse(raw)
+    }
+
+    /// Like `sendPersistentConversationMessage` but returns the raw response
+    /// JSON string instead of extracting text. Callers that need to see
+    /// `tool_calls` use this path and parse themselves.
+    private func sendPersistentConversationMessageRaw(
+        messageJSON: String,
+        tempURLs: [URL] = []
+    ) async throws -> String {
         let urlsToCleanup = tempURLs
         return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, any Error>) in
             self.inferenceQueue.async { [self, urlsToCleanup] in
@@ -1330,9 +1363,9 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                         throw LiteRTLMError.inferenceFailure("Persistent conversation response string is NULL")
                     }
 
-                    let result = Self.extractTextFromConversationResponse(String(cString: responsePtr))
+                    let raw = String(cString: responsePtr)
                     self.logConversationBenchmark(conversation)
-                    continuation.resume(returning: result)
+                    continuation.resume(returning: raw)
                 } catch {
                     continuation.resume(throwing: error)
                 }
@@ -1504,6 +1537,80 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             return #"{"role":"user","content":""}"#
         }
         return jsonString
+    }
+
+    /// Serialize tool declarations into the JSON array format the C API expects
+    /// for `tools_json`. Returns nil for an empty list.
+    nonisolated static func buildToolsJSON(_ tools: [ToolDeclaration]) -> String? {
+        guard !tools.isEmpty else { return nil }
+        var items: [[String: Any]] = []
+        for decl in tools {
+            guard let paramsData = decl.parametersJSON.data(using: .utf8),
+                  let paramsObj = try? JSONSerialization.jsonObject(with: paramsData) else {
+                continue
+            }
+            items.append([
+                "name": decl.name,
+                "description": decl.description,
+                "parameters": paramsObj
+            ])
+        }
+        guard !items.isEmpty,
+              let data = try? JSONSerialization.data(withJSONObject: items),
+              let json = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        return json
+    }
+
+    /// Build the message JSON for sending tool results back into a conversation.
+    /// Single result becomes a single message; multiple results become an array
+    /// of messages — both accepted by the runtime.
+    nonisolated static func buildToolResultsMessageJSON(_ results: [ToolResult]) -> String {
+        let messages: [[String: Any]] = results.compactMap { result in
+            guard let data = result.contentJSON.data(using: .utf8),
+                  let content = try? JSONSerialization.jsonObject(with: data) else {
+                return nil
+            }
+            return ["role": "tool", "content": content]
+        }
+        let payload: Any = messages.count == 1 ? messages[0] : messages
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let json = String(data: data, encoding: .utf8) else {
+            return "[]"
+        }
+        return json
+    }
+
+    /// Parse a raw conversation response into either text or tool calls.
+    /// Falls through to `.text(raw)` for any shape we don't recognize.
+    nonisolated static func parseConversationTurn(_ json: String) -> ConversationTurn {
+        guard let data = json.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return .text(json.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+
+        if let calls = obj["tool_calls"] as? [[String: Any]], !calls.isEmpty {
+            var parsed: [ToolCall] = []
+            for entry in calls {
+                guard let function = entry["function"] as? [String: Any],
+                      let name = function["name"] as? String else { continue }
+                let argumentsJSON: String
+                if let argsObj = function["arguments"],
+                   let argsData = try? JSONSerialization.data(withJSONObject: argsObj),
+                   let argsString = String(data: argsData, encoding: .utf8) {
+                    argumentsJSON = argsString
+                } else if let argsString = function["arguments"] as? String {
+                    argumentsJSON = argsString
+                } else {
+                    argumentsJSON = "{}"
+                }
+                parsed.append(ToolCall(name: name, argumentsJSON: argumentsJSON))
+            }
+            if !parsed.isEmpty { return .toolCalls(parsed) }
+        }
+
+        return .text(extractTextFromConversationResponse(json))
     }
 
     nonisolated static func extractTextFromConversationResponse(_ json: String) -> String {
