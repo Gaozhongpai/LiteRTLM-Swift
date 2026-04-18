@@ -645,6 +645,26 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         return Self.parseConversationTurn(raw)
     }
 
+    /// Streaming counterpart of `conversationSendTextWithTools`.
+    ///
+    /// Yields `.text(chunk)` events as the model generates tokens and
+    /// `.toolCalls(...)` events when the runtime has parsed complete tool
+    /// calls. The stream ends when the current turn finishes — call
+    /// `conversationSendToolResultsStreaming(_:)` for the next turn.
+    ///
+    /// Uses the same persistent Conversation as the non-streaming API so
+    /// the KV cache survives across turns.
+    public func conversationSendTextWithToolsStreaming(_ text: String) -> AsyncThrowingStream<ConversationTurn, Error> {
+        let messageJSON = Self.buildTextMessageJSON(text: text)
+        return streamPersistentConversationMessageWithTools(messageJSON: messageJSON)
+    }
+
+    /// Streaming counterpart of `conversationSendToolResults`.
+    public func conversationSendToolResultsStreaming(_ results: [ToolResult]) -> AsyncThrowingStream<ConversationTurn, Error> {
+        let messageJSON = Self.buildToolResultsMessageJSON(results)
+        return streamPersistentConversationMessageWithTools(messageJSON: messageJSON)
+    }
+
     /// Stream a text message through the persistent Conversation.
     ///
     /// The Conversation's KV cache holds all previous context. Each call appends
@@ -1373,6 +1393,76 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         }
     }
 
+    /// Streaming variant that yields `ConversationTurn` events — text chunks
+    /// and tool-call batches — on the persistent Conversation's KV cache.
+    private func streamPersistentConversationMessageWithTools(
+        messageJSON: String
+    ) -> AsyncThrowingStream<ConversationTurn, Error> {
+        AsyncThrowingStream { continuation in
+            self.inferenceQueue.async { [self] in
+                guard let conversation = self.chatConversation else {
+                    continuation.finish(throwing: LiteRTLMError.inferenceFailure("No persistent conversation open — call openConversation() first"))
+                    return
+                }
+
+                let streamDone = DispatchSemaphore(value: 0)
+                let state = ToolStreamCallbackState(continuation: continuation, doneSemaphore: streamDone)
+                let statePtr = Unmanaged.passRetained(state).toOpaque()
+
+                let callResult = messageJSON.withCString { msgPtr -> Int32 in
+                    litert_lm_conversation_send_message_stream(
+                        conversation, msgPtr, nil,
+                        { callbackData, chunk, isFinal, errorMsg in
+                            guard let cbData = callbackData else { return }
+                            let st = Unmanaged<ToolStreamCallbackState>.fromOpaque(cbData)
+                                .takeUnretainedValue()
+
+                            let errorMessage: String? = {
+                                guard let errorMsg else { return nil }
+                                let msg = String(cString: errorMsg)
+                                return msg.isEmpty ? nil : msg
+                            }()
+
+                            if let chunk, errorMessage == nil {
+                                let raw = String(cString: chunk)
+                                let event = LiteRTLMEngine.parseConversationTurn(raw)
+                                switch event {
+                                case .text(let t) where !t.isEmpty:
+                                    st.continuation.yield(.text(t))
+                                case .toolCalls(let calls) where !calls.isEmpty:
+                                    st.continuation.yield(.toolCalls(calls))
+                                default:
+                                    break
+                                }
+                            }
+
+                            if isFinal || errorMessage != nil {
+                                if let error = errorMessage {
+                                    st.continuation.finish(throwing: LiteRTLMError.inferenceFailure(error))
+                                } else {
+                                    st.continuation.finish()
+                                }
+                                let semaphore = st.doneSemaphore
+                                Unmanaged<ToolStreamCallbackState>.fromOpaque(cbData).release()
+                                semaphore.signal()
+                            }
+                        },
+                        statePtr
+                    )
+                }
+
+                if callResult != 0 {
+                    Unmanaged<ToolStreamCallbackState>.fromOpaque(statePtr).release()
+                    continuation.finish(throwing: LiteRTLMError.inferenceFailure("Failed to start conversation stream"))
+                    return
+                }
+
+                streamDone.wait()
+                self.logConversationBenchmark(conversation)
+            }
+        }
+    }
+
     /// Streaming counterpart of `sendPersistentConversationMessage`.
     ///
     /// Uses `litert_lm_conversation_send_message_stream` to yield tokens
@@ -1680,6 +1770,17 @@ private final class StreamCallbackState: @unchecked Sendable {
     let doneSemaphore: DispatchSemaphore
 
     init(continuation: AsyncThrowingStream<String, Error>.Continuation,
+         doneSemaphore: DispatchSemaphore) {
+        self.continuation = continuation
+        self.doneSemaphore = doneSemaphore
+    }
+}
+
+private final class ToolStreamCallbackState: @unchecked Sendable {
+    let continuation: AsyncThrowingStream<ConversationTurn, Error>.Continuation
+    let doneSemaphore: DispatchSemaphore
+
+    init(continuation: AsyncThrowingStream<ConversationTurn, Error>.Continuation,
          doneSemaphore: DispatchSemaphore) {
         self.continuation = continuation
         self.doneSemaphore = doneSemaphore
