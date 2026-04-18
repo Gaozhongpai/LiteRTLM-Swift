@@ -1602,12 +1602,16 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                 guard let function = entry["function"] as? [String: Any],
                       let name = function["name"] as? String else { continue }
                 let argumentsJSON: String
-                if let argsObj = function["arguments"],
-                   let argsData = try? JSONSerialization.data(withJSONObject: argsObj),
-                   let argsString = String(data: argsData, encoding: .utf8) {
-                    argumentsJSON = argsString
-                } else if let argsString = function["arguments"] as? String {
-                    argumentsJSON = argsString
+                if let argsObj = function["arguments"] {
+                    let cleaned = stripGemmaStringDelimiters(in: argsObj)
+                    if let argsData = try? JSONSerialization.data(withJSONObject: cleaned),
+                       let argsString = String(data: argsData, encoding: .utf8) {
+                        argumentsJSON = argsString
+                    } else if let argsString = argsObj as? String {
+                        argumentsJSON = cleanGemmaString(argsString)
+                    } else {
+                        argumentsJSON = "{}"
+                    }
                 } else {
                     argumentsJSON = "{}"
                 }
@@ -1617,6 +1621,31 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         }
 
         return .text(extractTextFromConversationResponse(json))
+    }
+
+    /// Recursively strip Gemma's `<|"|>` string-quote token from every
+    /// string leaf in a JSON value. The runtime's tool-call parser leaves
+    /// these delimiters in string arguments on some models.
+    private nonisolated static func stripGemmaStringDelimiters(in value: Any) -> Any {
+        if let s = value as? String {
+            return cleanGemmaString(s)
+        }
+        if let arr = value as? [Any] {
+            return arr.map { stripGemmaStringDelimiters(in: $0) }
+        }
+        if let dict = value as? [String: Any] {
+            var out: [String: Any] = [:]
+            for (k, v) in dict {
+                out[k] = stripGemmaStringDelimiters(in: v)
+            }
+            return out
+        }
+        return value
+    }
+
+    private nonisolated static func cleanGemmaString(_ s: String) -> String {
+        s.replacingOccurrences(of: "<|\"|>", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     nonisolated static func extractTextFromConversationResponse(_ json: String) -> String {
