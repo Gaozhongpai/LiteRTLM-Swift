@@ -1540,7 +1540,10 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     }
 
     /// Serialize tool declarations into the JSON array format the C API expects
-    /// for `tools_json`. Returns nil for an empty list.
+    /// for `tools_json`. Each entry is wrapped as
+    /// `{"type": "function", "function": {name, description, parameters}}` —
+    /// the shape Gemma 4's bundled Jinja chat template iterates over.
+    /// Returns nil for an empty list.
     nonisolated static func buildToolsJSON(_ tools: [ToolDeclaration]) -> String? {
         guard !tools.isEmpty else { return nil }
         var items: [[String: Any]] = []
@@ -1550,9 +1553,12 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                 continue
             }
             items.append([
-                "name": decl.name,
-                "description": decl.description,
-                "parameters": paramsObj
+                "type": "function",
+                "function": [
+                    "name": decl.name,
+                    "description": decl.description,
+                    "parameters": paramsObj
+                ]
             ])
         }
         guard !items.isEmpty,
