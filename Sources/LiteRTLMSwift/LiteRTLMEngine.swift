@@ -3,6 +3,9 @@ import CoreGraphics
 import ImageIO
 import os
 import CLiteRTLM
+#if canImport(Darwin)
+import Darwin
+#endif
 
 /// Swift wrapper for Google's LiteRT-LM on-device inference engine.
 ///
@@ -99,13 +102,15 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         let sesCfg = chatSessionConfig
         let conv = chatConversation
         let convCfg = chatConversationConfig
+        let branches = Array(storedConversationBranches.values)
         let queue = inferenceQueue
-        if eng != nil || ses != nil || conv != nil {
+        if eng != nil || ses != nil || conv != nil || !branches.isEmpty {
             queue.async {
                 if let s = ses { litert_lm_session_delete(s) }
                 if let c = sesCfg { litert_lm_session_config_delete(c) }
                 if let c = conv { litert_lm_conversation_delete(c) }
                 if let c = convCfg { litert_lm_conversation_config_delete(c) }
+                for branch in branches { litert_lm_conversation_delete(branch) }
                 if let e = eng { litert_lm_engine_delete(e) }
             }
         }
@@ -200,6 +205,10 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                 litert_lm_conversation_config_delete(c)
                 chatConversationConfig = nil
             }
+            for branch in storedConversationBranches.values {
+                litert_lm_conversation_delete(branch)
+            }
+            storedConversationBranches.removeAll()
             if let eng = engine { litert_lm_engine_delete(eng) }
             engine = nil
         }
@@ -461,6 +470,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     private var chatSessionConfig: OpaquePointer?
     private var chatConversation: OpaquePointer?
     private var chatConversationConfig: OpaquePointer?
+    private var storedConversationBranches: [String: OpaquePointer] = [:]
 
     /// Open a persistent session for multi-turn generation with KV cache reuse.
     ///
@@ -611,6 +621,152 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                 chatSessionConfig = nil
             }
             Self.log.info("Persistent conversation closed")
+        }
+    }
+
+    /// Create and store a named conversation branch.
+    ///
+    /// The branch is opened and prewarmed immediately using the provided
+    /// system prompt, restored history, and tool declarations. You can later
+    /// activate it into the engine's persistent conversation slot with
+    /// `activateConversationBranch(_:)`.
+    public func openConversationBranch(
+        _ branchID: String,
+        systemPrompt: String? = nil,
+        historyJSON: String? = nil,
+        tools: [ToolDeclaration] = [],
+        temperature: Float = 0.3,
+        maxTokens: Int = 512
+    ) async throws {
+        try ensureReady()
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            inferenceQueue.async { [self] in
+                do {
+                    guard let eng = engine else { throw LiteRTLMError.modelNotLoaded }
+                    let conversation = try createConversationHandle(
+                        engine: eng,
+                        systemPrompt: systemPrompt,
+                        historyJSON: historyJSON,
+                        tools: tools,
+                        temperature: temperature,
+                        maxTokens: maxTokens
+                    )
+                    deleteStoredConversationBranchLocked(branchID)
+                    storedConversationBranches[branchID] = conversation
+                    Self.log.info("Stored conversation branch: \(branchID, privacy: .public)")
+                    cont.resume()
+                } catch {
+                    cont.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// Save a clone of the currently-open persistent conversation into a named
+    /// branch. Requires a CLiteRTLM build that exports
+    /// `litert_lm_conversation_clone`.
+    public func saveConversationBranch(_ branchID: String) async throws {
+        try ensureReady()
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            inferenceQueue.async { [self] in
+                do {
+                    guard let conversation = chatConversation else {
+                        throw LiteRTLMError.inferenceFailure("No persistent conversation open — call openConversation() first")
+                    }
+                    let clone = try cloneConversationHandle(conversation)
+                    deleteStoredConversationBranchLocked(branchID)
+                    storedConversationBranches[branchID] = clone
+                    Self.log.info("Saved persistent conversation branch: \(branchID, privacy: .public)")
+                    cont.resume()
+                } catch {
+                    cont.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// Clone one stored conversation branch into another stored branch.
+    ///
+    /// This is the key primitive for "shared base prewarm then branch" flows:
+    /// keep a base branch warm, clone it, then activate the clone and append
+    /// page-specific turns.
+    public func cloneConversationBranch(
+        _ sourceBranchID: String,
+        as targetBranchID: String
+    ) async throws {
+        try ensureReady()
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            inferenceQueue.async { [self] in
+                do {
+                    guard let source = storedConversationBranches[sourceBranchID] else {
+                        throw LiteRTLMError.inferenceFailure("Conversation branch '\(sourceBranchID)' was not found.")
+                    }
+                    let clone = try cloneConversationHandle(source)
+                    deleteStoredConversationBranchLocked(targetBranchID)
+                    storedConversationBranches[targetBranchID] = clone
+                    Self.log.info(
+                        "Cloned conversation branch \(sourceBranchID, privacy: .public) -> \(targetBranchID, privacy: .public)"
+                    )
+                    cont.resume()
+                } catch {
+                    cont.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// Activate a stored branch by cloning it into the engine's persistent
+    /// conversation slot used by `conversationSend*` APIs.
+    public func activateConversationBranch(_ branchID: String) async throws {
+        try ensureReady()
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            inferenceQueue.async { [self] in
+                do {
+                    guard let stored = storedConversationBranches[branchID] else {
+                        throw LiteRTLMError.inferenceFailure("Conversation branch '\(branchID)' was not found.")
+                    }
+                    let clone = try cloneConversationHandle(stored)
+                    if let c = chatConversation {
+                        logConversationBenchmark(c)
+                        litert_lm_conversation_delete(c)
+                        chatConversation = nil
+                    }
+                    if let c = chatConversationConfig {
+                        litert_lm_conversation_config_delete(c)
+                        chatConversationConfig = nil
+                    }
+                    if let c = chatSessionConfig {
+                        litert_lm_session_config_delete(c)
+                        chatSessionConfig = nil
+                    }
+                    if let s = chatSession {
+                        logSessionBenchmark(s)
+                        litert_lm_session_delete(s)
+                        chatSession = nil
+                    }
+                    chatConversation = clone
+                    Self.log.info("Activated conversation branch: \(branchID, privacy: .public)")
+                    cont.resume()
+                } catch {
+                    cont.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// Delete a stored conversation branch and free its warmed native state.
+    public func deleteConversationBranch(_ branchID: String) {
+        inferenceQueue.async { [self] in
+            deleteStoredConversationBranchLocked(branchID)
+        }
+    }
+
+    /// Returns true if a named conversation branch is currently stored.
+    public func hasConversationBranch(_ branchID: String) async -> Bool {
+        await withCheckedContinuation { continuation in
+            inferenceQueue.async { [self] in
+                continuation.resume(returning: storedConversationBranches[branchID] != nil)
+            }
         }
     }
 
@@ -1211,6 +1367,59 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         }
     }
 
+    private func createConversationHandle(
+        engine eng: OpaquePointer,
+        systemPrompt: String?,
+        historyJSON: String?,
+        tools: [ToolDeclaration],
+        temperature: Float,
+        maxTokens: Int
+    ) throws -> OpaquePointer {
+        let sessionConfig = try createSessionConfig(
+            temperature: temperature,
+            maxTokens: Int32(maxTokens)
+        )
+        defer { litert_lm_session_config_delete(sessionConfig) }
+
+        let toolsJSON = Self.buildToolsJSON(tools)
+        guard let conversationConfig = createConversationConfig(
+            engine: eng,
+            sessionConfig: sessionConfig,
+            systemPrompt: systemPrompt,
+            toolsJSON: toolsJSON,
+            historyJSON: historyJSON
+        ) else {
+            throw LiteRTLMError.inferenceFailure("Failed to create conversation config")
+        }
+        defer { litert_lm_conversation_config_delete(conversationConfig) }
+
+        guard let conversation = litert_lm_conversation_create(eng, conversationConfig) else {
+            throw LiteRTLMError.inferenceFailure("Failed to create conversation")
+        }
+        return conversation
+    }
+
+    private func cloneConversationHandle(_ conversation: OpaquePointer) throws -> OpaquePointer {
+        typealias ConversationCloneFn = @convention(c) (OpaquePointer) -> OpaquePointer?
+        let symbolName = "litert_lm_conversation_clone"
+        let defaultHandle = UnsafeMutableRawPointer(bitPattern: -2)
+        guard let symbol = dlsym(defaultHandle, symbolName) else {
+            throw LiteRTLMError.featureUnavailable(
+                "Conversation cloning requires a rebuilt CLiteRTLM.xcframework that exports \(symbolName)."
+            )
+        }
+        let cloneFn = unsafeBitCast(symbol, to: ConversationCloneFn.self)
+        guard let cloned = cloneFn(conversation) else {
+            throw LiteRTLMError.inferenceFailure("Failed to clone conversation")
+        }
+        return cloned
+    }
+
+    private func deleteStoredConversationBranchLocked(_ branchID: String) {
+        guard let conversation = storedConversationBranches.removeValue(forKey: branchID) else { return }
+        litert_lm_conversation_delete(conversation)
+    }
+
     private nonisolated static func withOptionalCString<T>(
         _ value: String?,
         _ body: (UnsafePointer<CChar>?) -> T
@@ -1793,6 +2002,7 @@ public enum LiteRTLMError: LocalizedError {
     case modelNotFound
     case modelNotLoaded
     case engineCreationFailed(String)
+    case featureUnavailable(String)
     case inferenceFailure(String)
 
     public var errorDescription: String? {
@@ -1803,6 +2013,8 @@ public enum LiteRTLMError: LocalizedError {
             "LiteRT-LM model is not loaded — call load() first"
         case .engineCreationFailed(let detail):
             "Failed to create LiteRT-LM engine: \(detail)"
+        case .featureUnavailable(let detail):
+            "LiteRT-LM feature unavailable: \(detail)"
         case .inferenceFailure(let detail):
             "LiteRT-LM inference failed: \(detail)"
         }

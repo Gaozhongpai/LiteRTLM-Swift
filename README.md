@@ -5,6 +5,8 @@ Swift package for running [LiteRT-LM](https://ai.google.dev/edge/litert/lm) mode
 Supports **text generation**, **vision (image understanding)**, **audio (speech/sound understanding)**, and **streaming** with models like **Gemma 4 E2B**.
 
 > **Note:** This is a community project, not an official Google product. The included `CLiteRTLM.xcframework` is built from Google's open-source [LiteRT-LM](https://github.com/google-ai-edge/LiteRT-LM) C API (Apache 2.0).
+>
+> **Advanced conversation branching:** the Swift source now includes branch-management APIs built around LiteRT-LM conversation cloning. To use them, rebuild `CLiteRTLM.xcframework` from the updated LiteRT-LM C API so the new `litert_lm_conversation_clone` symbol is present.
 
 ## Requirements
 
@@ -178,6 +180,36 @@ for try await chunk in engine.sessionGenerateStreaming(
 engine.closeSession()
 ```
 
+### Conversation Branching (Shared Base Prefill)
+
+If your app has multiple page-specific assistants that all share a common base
+context, prewarm that base once, store it as a branch, then clone from it:
+
+```swift
+// Open and prewarm a reusable base conversation branch.
+try await engine.openConversationBranch(
+    "base",
+    systemPrompt: "You are Milo, an on-device assistant.",
+    historyJSON: priorHistoryJSON,
+    tools: sharedTools
+)
+
+// Clone base -> milo and base -> project without paying full prefill twice.
+try await engine.cloneConversationBranch("base", as: "milo")
+try await engine.cloneConversationBranch("base", as: "project")
+
+// Activate the branch you want to use for normal conversationSend* APIs.
+try await engine.activateConversationBranch("milo")
+let reply = try await engine.conversationSendText("Let's keep this casual.")
+
+// Later, switch to a different branch by activating it.
+try await engine.activateConversationBranch("project")
+```
+
+This is the recommended pattern for apps that need fast switching between
+multiple conversation personas or workspaces while staying on the Conversation
+API.
+
 ### Download Progress Tracking
 
 `ModelDownloader` is `@Observable`, so you can bind directly in SwiftUI:
@@ -254,6 +286,12 @@ struct EngineView: View {
 | `openSession(temperature:maxTokens:)` | Open persistent session for multi-turn chat (KV cache reuse) |
 | `sessionGenerateStreaming(input:)` | Stream generation using persistent session |
 | `closeSession()` | Close persistent session, free KV cache |
+| `openConversationBranch(_:systemPrompt:historyJSON:tools:temperature:maxTokens:)` | Create and store a named prewarmed conversation branch |
+| `saveConversationBranch(_:)` | Clone the current persistent conversation into a stored branch |
+| `cloneConversationBranch(_:as:)` | Clone one stored branch into another |
+| `activateConversationBranch(_:)` | Clone a stored branch into the persistent conversation slot |
+| `deleteConversationBranch(_:)` | Delete a stored branch and free its native resources |
+| `hasConversationBranch(_:)` | Check whether a stored branch exists |
 
 | Property | Type | Description |
 |----------|------|-------------|
@@ -349,6 +387,7 @@ Tell me more.
 
 - **Session API** — raw text prompts via `InputData`. You control the prompt format. Used by `generate()`, `generateStreaming()`, `openSession()`.
 - **Conversation API** — JSON-based messages with image/audio file paths. Handles image decode/resize/patchify and audio decode/resample/mel-spectrogram internally. Used by `vision()`, `visionMultiImage()`, `audio()`, `multimodal()`.
+- **Conversation branching** — keep a shared prewarmed base conversation, clone it into page-specific branches, then activate whichever branch should back the current UI.
 - All C API calls are serialized on a single `DispatchQueue` for thread safety. LiteRT-LM supports only one active session at a time.
 
 ## Building the XCFramework from Source
