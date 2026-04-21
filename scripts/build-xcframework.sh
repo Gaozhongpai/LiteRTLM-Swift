@@ -209,11 +209,12 @@ MODULEMAP
 </plist>
 PLIST
 
-    # Ad-hoc code sign
-    codesign --force --sign - "$FW_DIR/$FRAMEWORK_NAME"
+    # Sign nested code before the framework bundle so the framework's sealed
+    # resources capture the final dylib hash.
     if [ -n "$EXTRA_DYLIB" ] && [ -f "$FW_DIR/$(basename "$EXTRA_DYLIB")" ]; then
         codesign --force --sign - "$FW_DIR/$(basename "$EXTRA_DYLIB")"
     fi
+    codesign --force --sign - "$FW_DIR/$FRAMEWORK_NAME"
 
     info "Packaged $ARCH_NAME framework at $FW_DIR"
 }

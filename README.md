@@ -599,10 +599,12 @@ EOF
 done
 ```
 
-Ad-hoc code sign:
+Ad-hoc code sign nested binaries before the framework bundle:
 
 ```bash
+codesign --force --sign - /tmp/ios-arm64/CLiteRTLM.framework/libGemmaModelConstraintProvider.dylib
 codesign --force --sign - /tmp/ios-arm64/CLiteRTLM.framework/CLiteRTLM
+codesign --force --sign - /tmp/ios-arm64-simulator/CLiteRTLM.framework/libGemmaModelConstraintProvider.dylib
 codesign --force --sign - /tmp/ios-arm64-simulator/CLiteRTLM.framework/CLiteRTLM
 ```
 
