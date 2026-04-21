@@ -154,6 +154,65 @@ let response = try await engine.multimodal(
 )
 ```
 
+### Persistent Conversation with Images / Audio / Mixed Turns
+
+The Conversation API can keep multimodal state warm across turns:
+
+```swift
+try await engine.openConversation(
+    systemPrompt: "You are a helpful multimodal assistant."
+)
+
+let textReply = try await engine.conversationSendText("What should I look for?")
+
+let imageReply = try await engine.conversationSendImage(
+    imageData: photoData,
+    prompt: "What stands out in this image?"
+)
+
+let multimodalReply = try await engine.conversationSendMultimodal(
+    audioData: [audioClipData],
+    imagesData: [frame1Data, frame2Data],
+    prompt: "Do these video frames match what the speaker is describing?"
+)
+```
+
+If your source is a video, extract representative frames in your app and pass
+them as `imagesData`. `LiteRTLM-Swift` does not decode video containers itself.
+
+### Tool-Enabled Conversations
+
+The persistent Conversation API also supports native tool calling when you open
+the conversation with `tools:`.
+
+```swift
+try await engine.openConversation(
+    systemPrompt: "You help manage tasks.",
+    tools: [
+        ToolDeclaration(
+            name: "set_title",
+            description: "Set the workspace title.",
+            parametersJSON: titleSchemaJSON
+        )
+    ]
+)
+
+let turn = try await engine.conversationSendTextWithTools(
+    "Please title this chat after the user's request."
+)
+
+switch turn {
+case .text(let text):
+    print(text)
+case .toolCalls(let calls):
+    let results = calls.compactMap { call in
+        ToolResult(toolName: call.name, content: ["ok": true])
+    }
+    let followUp = try await engine.conversationSendToolResults(results)
+    print(followUp)
+}
+```
+
 ### Multi-Turn Chat (KV Cache Reuse)
 
 For multi-turn conversations, use the persistent session API. The KV cache is preserved across turns, reducing time-to-first-token from ~20s to ~1-2s on follow-up messages.
@@ -286,6 +345,22 @@ struct EngineView: View {
 | `openSession(temperature:maxTokens:)` | Open persistent session for multi-turn chat (KV cache reuse) |
 | `sessionGenerateStreaming(input:)` | Stream generation using persistent session |
 | `closeSession()` | Close persistent session, free KV cache |
+| `openConversation(systemPrompt:historyJSON:tools:temperature:maxTokens:)` | Open a persistent multimodal Conversation |
+| `closeConversation()` | Close the persistent Conversation |
+| `conversationSendText(_:)` | Send a text turn through the persistent Conversation |
+| `conversationSendTextStreaming(_:)` | Stream a text turn through the persistent Conversation |
+| `conversationSendTextWithTools(_:)` | Send a text turn and receive either text or parsed tool calls |
+| `conversationSendToolResults(_:)` | Send tool results back into the persistent Conversation |
+| `conversationSendTextWithToolsStreaming(_:)` | Stream `ConversationTurn` events from a tool-enabled Conversation |
+| `conversationSendToolResultsStreaming(_:)` | Stream the follow-up turn after returning tool results |
+| `conversationSendAudio(audioData:prompt:format:)` | Send an audio turn through the persistent Conversation |
+| `conversationSendAudioStreaming(audioData:prompt:format:)` | Stream an audio turn through the persistent Conversation |
+| `conversationSendImage(imageData:prompt:maxImageDimension:)` | Send a single image turn through the persistent Conversation |
+| `conversationSendImageStreaming(imageData:prompt:maxImageDimension:)` | Stream a single image turn through the persistent Conversation |
+| `conversationSendImages(imagesData:prompt:maxImageDimension:)` | Send a multi-image turn through the persistent Conversation |
+| `conversationSendImagesStreaming(imagesData:prompt:maxImageDimension:)` | Stream a multi-image turn through the persistent Conversation |
+| `conversationSendMultimodal(audioData:audioFormat:imagesData:prompt:maxImageDimension:)` | Send a mixed audio + image turn through the persistent Conversation |
+| `conversationSendMultimodalStreaming(audioData:audioFormat:imagesData:prompt:maxImageDimension:)` | Stream a mixed audio + image turn through the persistent Conversation |
 | `openConversationBranch(_:systemPrompt:historyJSON:tools:temperature:maxTokens:)` | Create and store a named prewarmed conversation branch |
 | `saveConversationBranch(_:)` | Clone the current persistent conversation into a stored branch |
 | `cloneConversationBranch(_:as:)` | Clone one stored branch into another |
@@ -317,7 +392,7 @@ struct EngineView: View {
 
 ### Gemma 4 Prompt Format
 
-The **Session API** (text generation) requires Gemma 4's native turn marker format. The **Conversation API** (vision) does NOT — just pass plain text.
+The **Session API** (text generation) requires Gemma 4's native turn marker format. The **Conversation API** does NOT — just pass plain text.
 
 ```
 <|turn>user

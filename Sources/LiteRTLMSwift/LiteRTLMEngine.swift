@@ -279,20 +279,16 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         maxImageDimension: Int = 1024
     ) async throws -> String {
         try ensureReady()
-
-        guard let jpegData = Self.prepareImageForVision(imageData, maxDimension: maxImageDimension) else {
-            throw LiteRTLMError.inferenceFailure("Failed to convert image to JPEG")
-        }
-
-        let tempURL = Self.makeTempURL(extension: "jpg")
-        try jpegData.write(to: tempURL)
-
-        let messageJSON = Self.buildMultimodalMessageJSON(
-            audioPaths: [], imagePaths: [tempURL.path], text: prompt
+        let payload = try Self.prepareMultimodalPayload(
+            audioData: [],
+            audioFormat: .wav,
+            imagesData: [imageData],
+            prompt: prompt,
+            maxImageDimension: maxImageDimension
         )
         return try await runConversationInference(
-            messageJSON: messageJSON,
-            tempURLs: [tempURL],
+            messageJSON: payload.messageJSON,
+            tempURLs: payload.tempURLs,
             temperature: temperature,
             maxTokens: maxTokens
         )
@@ -318,28 +314,16 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         guard !imagesData.isEmpty else {
             throw LiteRTLMError.inferenceFailure("No images provided")
         }
-
-        var tempURLs: [URL] = []
-        do {
-            for (i, data) in imagesData.enumerated() {
-                guard let jpegData = Self.prepareImageForVision(data, maxDimension: maxImageDimension) else {
-                    throw LiteRTLMError.inferenceFailure("Failed to convert image \(i + 1) to JPEG")
-                }
-                let url = Self.makeTempURL(extension: "jpg")
-                try jpegData.write(to: url)
-                tempURLs.append(url)
-            }
-        } catch {
-            Self.cleanupTempFiles(tempURLs)
-            throw error
-        }
-
-        let messageJSON = Self.buildMultimodalMessageJSON(
-            audioPaths: [], imagePaths: tempURLs.map(\.path), text: prompt
+        let payload = try Self.prepareMultimodalPayload(
+            audioData: [],
+            audioFormat: .wav,
+            imagesData: imagesData,
+            prompt: prompt,
+            maxImageDimension: maxImageDimension
         )
         return try await runConversationInference(
-            messageJSON: messageJSON,
-            tempURLs: tempURLs,
+            messageJSON: payload.messageJSON,
+            tempURLs: payload.tempURLs,
             temperature: temperature,
             maxTokens: maxTokens
         )
@@ -375,16 +359,16 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         guard !audioData.isEmpty else {
             throw LiteRTLMError.inferenceFailure("No audio data provided")
         }
-
-        let tempURL = Self.makeTempURL(extension: format.rawValue)
-        try audioData.write(to: tempURL)
-
-        let messageJSON = Self.buildMultimodalMessageJSON(
-            audioPaths: [tempURL.path], imagePaths: [], text: prompt
+        let payload = try Self.prepareMultimodalPayload(
+            audioData: [audioData],
+            audioFormat: format,
+            imagesData: [],
+            prompt: prompt,
+            maxImageDimension: 1024
         )
         return try await runConversationInference(
-            messageJSON: messageJSON,
-            tempURLs: [tempURL],
+            messageJSON: payload.messageJSON,
+            tempURLs: payload.tempURLs,
             temperature: temperature,
             maxTokens: maxTokens
         )
@@ -416,44 +400,16 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         guard !audioData.isEmpty || !imagesData.isEmpty else {
             throw LiteRTLMError.inferenceFailure("No audio or image data provided")
         }
-
-        var tempURLs: [URL] = []
-        var audioPaths: [String] = []
-        var imagePaths: [String] = []
-
-        do {
-            // Write audio files
-            for (i, data) in audioData.enumerated() {
-                guard !data.isEmpty else {
-                    throw LiteRTLMError.inferenceFailure("Audio data \(i + 1) is empty")
-                }
-                let url = Self.makeTempURL(extension: audioFormat.rawValue)
-                try data.write(to: url)
-                tempURLs.append(url)
-                audioPaths.append(url.path)
-            }
-
-            // Write image files
-            for (i, data) in imagesData.enumerated() {
-                guard let jpegData = Self.prepareImageForVision(data, maxDimension: maxImageDimension) else {
-                    throw LiteRTLMError.inferenceFailure("Failed to convert image \(i + 1) to JPEG")
-                }
-                let url = Self.makeTempURL(extension: "jpg")
-                try jpegData.write(to: url)
-                tempURLs.append(url)
-                imagePaths.append(url.path)
-            }
-        } catch {
-            Self.cleanupTempFiles(tempURLs)
-            throw error
-        }
-
-        let messageJSON = Self.buildMultimodalMessageJSON(
-            audioPaths: audioPaths, imagePaths: imagePaths, text: prompt
+        let payload = try Self.prepareMultimodalPayload(
+            audioData: audioData,
+            audioFormat: audioFormat,
+            imagesData: imagesData,
+            prompt: prompt,
+            maxImageDimension: maxImageDimension
         )
         return try await runConversationInference(
-            messageJSON: messageJSON,
-            tempURLs: tempURLs,
+            messageJSON: payload.messageJSON,
+            tempURLs: payload.tempURLs,
             temperature: temperature,
             maxTokens: maxTokens
         )
@@ -871,6 +827,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         prompt: String,
         format: AudioFormat = .wav
     ) throws -> AsyncThrowingStream<String, Error> {
+        try ensureReady()
         guard !audioData.isEmpty else {
             throw LiteRTLMError.inferenceFailure("No audio data provided")
         }
@@ -885,6 +842,127 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         return streamPersistentConversationMessage(
             messageJSON: messageJSON,
             tempURLs: [tempURL]
+        )
+    }
+
+    /// Send a single image through the persistent Conversation.
+    ///
+    /// The Conversation's KV cache holds all previous context. The image is
+    /// auto-converted to JPEG and resized before being attached to the user
+    /// turn.
+    public func conversationSendImage(
+        imageData: Data,
+        prompt: String,
+        maxImageDimension: Int = 1024
+    ) async throws -> String {
+        try await conversationSendImages(
+            imagesData: [imageData],
+            prompt: prompt,
+            maxImageDimension: maxImageDimension
+        )
+    }
+
+    /// Streaming counterpart of `conversationSendImage`.
+    public func conversationSendImageStreaming(
+        imageData: Data,
+        prompt: String,
+        maxImageDimension: Int = 1024
+    ) throws -> AsyncThrowingStream<String, Error> {
+        try ensureReady()
+        return try conversationSendImagesStreaming(
+            imagesData: [imageData],
+            prompt: prompt,
+            maxImageDimension: maxImageDimension
+        )
+    }
+
+    /// Send one or more images through the persistent Conversation.
+    ///
+    /// The Conversation's KV cache holds all previous context (text, audio,
+    /// and image turns). Input images are auto-converted to JPEG and resized.
+    public func conversationSendImages(
+        imagesData: [Data],
+        prompt: String,
+        maxImageDimension: Int = 1024
+    ) async throws -> String {
+        try ensureReady()
+        let payload = try Self.prepareMultimodalPayload(
+            audioData: [],
+            audioFormat: .wav,
+            imagesData: imagesData,
+            prompt: prompt,
+            maxImageDimension: maxImageDimension
+        )
+        return try await sendPersistentConversationMessage(
+            messageJSON: payload.messageJSON,
+            tempURLs: payload.tempURLs
+        )
+    }
+
+    /// Streaming counterpart of `conversationSendImages`.
+    public func conversationSendImagesStreaming(
+        imagesData: [Data],
+        prompt: String,
+        maxImageDimension: Int = 1024
+    ) throws -> AsyncThrowingStream<String, Error> {
+        try ensureReady()
+        let payload = try Self.prepareMultimodalPayload(
+            audioData: [],
+            audioFormat: .wav,
+            imagesData: imagesData,
+            prompt: prompt,
+            maxImageDimension: maxImageDimension
+        )
+        return streamPersistentConversationMessage(
+            messageJSON: payload.messageJSON,
+            tempURLs: payload.tempURLs
+        )
+    }
+
+    /// Send a mixed audio + image turn through the persistent Conversation.
+    ///
+    /// Useful for stateful multimodal assistants that need to keep prior text,
+    /// image, and audio context warm on the same Conversation.
+    public func conversationSendMultimodal(
+        audioData: [Data] = [],
+        audioFormat: AudioFormat = .wav,
+        imagesData: [Data] = [],
+        prompt: String,
+        maxImageDimension: Int = 1024
+    ) async throws -> String {
+        try ensureReady()
+        let payload = try Self.prepareMultimodalPayload(
+            audioData: audioData,
+            audioFormat: audioFormat,
+            imagesData: imagesData,
+            prompt: prompt,
+            maxImageDimension: maxImageDimension
+        )
+        return try await sendPersistentConversationMessage(
+            messageJSON: payload.messageJSON,
+            tempURLs: payload.tempURLs
+        )
+    }
+
+    /// Streaming counterpart of `conversationSendMultimodal`.
+    public func conversationSendMultimodalStreaming(
+        audioData: [Data] = [],
+        audioFormat: AudioFormat = .wav,
+        imagesData: [Data] = [],
+        prompt: String,
+        maxImageDimension: Int = 1024
+    ) throws -> AsyncThrowingStream<String, Error> {
+        try ensureReady()
+        let payload = try Self.prepareMultimodalPayload(
+            audioData: audioData,
+            audioFormat: audioFormat,
+            imagesData: imagesData,
+            prompt: prompt,
+            maxImageDimension: maxImageDimension
+        )
+        return streamPersistentConversationMessage(
+            messageJSON: payload.messageJSON,
+            tempURLs: payload.tempURLs
         )
     }
 
@@ -1802,6 +1880,56 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
         guard CGImageDestinationFinalize(destination) else { return nil }
         return mutableData as Data
+    }
+
+    nonisolated static func prepareMultimodalPayload(
+        audioData: [Data],
+        audioFormat: AudioFormat,
+        imagesData: [Data],
+        prompt: String,
+        maxImageDimension: Int
+    ) throws -> (messageJSON: String, tempURLs: [URL]) {
+        guard !audioData.isEmpty || !imagesData.isEmpty else {
+            throw LiteRTLMError.inferenceFailure("No audio or image data provided")
+        }
+
+        var tempURLs: [URL] = []
+        var audioPaths: [String] = []
+        var imagePaths: [String] = []
+
+        do {
+            for (i, data) in audioData.enumerated() {
+                guard !data.isEmpty else {
+                    throw LiteRTLMError.inferenceFailure("Audio data \(i + 1) is empty")
+                }
+                let url = Self.makeTempURL(extension: audioFormat.rawValue)
+                try data.write(to: url)
+                tempURLs.append(url)
+                audioPaths.append(url.path)
+            }
+
+            for (i, data) in imagesData.enumerated() {
+                guard let jpegData = Self.prepareImageForVision(data, maxDimension: maxImageDimension) else {
+                    throw LiteRTLMError.inferenceFailure("Failed to convert image \(i + 1) to JPEG")
+                }
+                let url = Self.makeTempURL(extension: "jpg")
+                try jpegData.write(to: url)
+                tempURLs.append(url)
+                imagePaths.append(url.path)
+            }
+        } catch {
+            Self.cleanupTempFiles(tempURLs)
+            throw error
+        }
+
+        return (
+            messageJSON: Self.buildMultimodalMessageJSON(
+                audioPaths: audioPaths,
+                imagePaths: imagePaths,
+                text: prompt
+            ),
+            tempURLs: tempURLs
+        )
     }
 
     /// Build a Conversation API JSON message with any combination of audio, images, and text.
