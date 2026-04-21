@@ -453,6 +453,19 @@ LITERT_LM_C_API_EXPORT
 LiteRtLmConversation* litert_lm_conversation_create(
     LiteRtLmEngine* engine, LiteRtLmConversationConfig* config);
 
+// Clones an existing LiteRT LM Conversation.
+//
+// The cloned conversation keeps the original conversation's current history and
+// warmed state, but can then diverge independently. This is useful for
+// branching multiple page-specific conversations from a shared prewarmed base
+// context.
+//
+// @param conversation The conversation to clone.
+// @return A pointer to the cloned conversation, or NULL on failure.
+LITERT_LM_C_API_EXPORT
+LiteRtLmConversation* litert_lm_conversation_clone(
+    LiteRtLmConversation* conversation);
+
 // Destroys a LiteRT LM Conversation.
 //
 // @param conversation The conversation to destroy.

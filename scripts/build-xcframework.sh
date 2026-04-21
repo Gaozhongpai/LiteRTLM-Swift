@@ -67,6 +67,24 @@ fi
 info "Using $($BAZEL_CMD --version | head -1)"
 info "Using $(xcodebuild -version | head -1)"
 
+DEVELOPER_DIR="$(xcode-select -p)"
+export DEVELOPER_DIR
+
+XCODE_SHORT_VERSION="$(xcodebuild -version | awk '/^Xcode / { print $2; exit }')"
+XCODE_BUILD_VERSION="$(xcodebuild -version | awk '/^Build version / { print $3; exit }')"
+
+if [ -z "$XCODE_SHORT_VERSION" ] || [ -z "$XCODE_BUILD_VERSION" ]; then
+    error "Failed to determine active Xcode version/build from xcodebuild -version"
+fi
+
+BAZEL_XCODE_FLAGS=(
+    "--xcode_version=$XCODE_SHORT_VERSION"
+    "--repo_env=DEVELOPER_DIR=$DEVELOPER_DIR"
+    "--action_env=DEVELOPER_DIR=$DEVELOPER_DIR"
+)
+
+info "Pinning Bazel to Xcode $XCODE_SHORT_VERSION ($XCODE_BUILD_VERSION)"
+
 # ---------------------------------------------------------------------------
 # 3. Build for iOS device (arm64)
 # ---------------------------------------------------------------------------
@@ -74,7 +92,7 @@ info "Using $(xcodebuild -version | head -1)"
 info "Building for iOS device (arm64)..."
 cd "$LITERT_LM_DIR"
 
-$BAZEL_CMD build --config=ios_arm64 //c:libLiteRTLMEngine.dylib
+$BAZEL_CMD build "${BAZEL_XCODE_FLAGS[@]}" --config=ios_arm64 //c:libLiteRTLMEngine.dylib
 
 DEVICE_DYLIB="$LITERT_LM_DIR/bazel-bin/c/libLiteRTLMEngine.dylib"
 if [ ! -f "$DEVICE_DYLIB" ]; then
@@ -88,7 +106,7 @@ info "Device build OK: $(du -h "$DEVICE_DYLIB" | cut -f1)"
 
 info "Building for iOS simulator (arm64)..."
 
-$BAZEL_CMD build --config=ios_sim_arm64 //c:libLiteRTLMEngine.dylib
+$BAZEL_CMD build "${BAZEL_XCODE_FLAGS[@]}" --config=ios_sim_arm64 //c:libLiteRTLMEngine.dylib
 
 SIM_DYLIB="$LITERT_LM_DIR/bazel-bin/c/libLiteRTLMEngine.dylib"
 if [ ! -f "$SIM_DYLIB" ]; then
@@ -102,7 +120,7 @@ cp "$SIM_DYLIB" "$SIM_DYLIB_COPY"
 
 # Rebuild device to restore bazel-bin
 info "Restoring device build..."
-$BAZEL_CMD build --config=ios_arm64 //c:libLiteRTLMEngine.dylib
+$BAZEL_CMD build "${BAZEL_XCODE_FLAGS[@]}" --config=ios_arm64 //c:libLiteRTLMEngine.dylib
 DEVICE_DYLIB="$LITERT_LM_DIR/bazel-bin/c/libLiteRTLMEngine.dylib"
 
 # Also grab the GemmaModelConstraintProvider dylib if present.
