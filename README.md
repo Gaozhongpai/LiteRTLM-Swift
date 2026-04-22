@@ -541,11 +541,15 @@ Each architecture needs to be wrapped in a `.framework` bundle before creating t
 mkdir -p /tmp/ios-arm64/CLiteRTLM.framework/{Headers,Modules}
 cp /tmp/libLiteRTLMEngine-device.dylib /tmp/ios-arm64/CLiteRTLM.framework/CLiteRTLM
 install_name_tool -id "@rpath/CLiteRTLM.framework/CLiteRTLM" /tmp/ios-arm64/CLiteRTLM.framework/CLiteRTLM
+cp prebuilt/ios_arm64/libGemmaModelConstraintProvider.dylib /tmp/ios-arm64/CLiteRTLM.framework/
+install_name_tool -change "@rpath/libGemmaModelConstraintProvider.dylib" "@loader_path/libGemmaModelConstraintProvider.dylib" /tmp/ios-arm64/CLiteRTLM.framework/CLiteRTLM
 
 # Simulator framework
 mkdir -p /tmp/ios-arm64-simulator/CLiteRTLM.framework/{Headers,Modules}
 cp /tmp/libLiteRTLMEngine-sim.dylib /tmp/ios-arm64-simulator/CLiteRTLM.framework/CLiteRTLM
 install_name_tool -id "@rpath/CLiteRTLM.framework/CLiteRTLM" /tmp/ios-arm64-simulator/CLiteRTLM.framework/CLiteRTLM
+cp prebuilt/ios_sim_arm64/libGemmaModelConstraintProvider.dylib /tmp/ios-arm64-simulator/CLiteRTLM.framework/
+install_name_tool -change "@rpath/libGemmaModelConstraintProvider.dylib" "@loader_path/libGemmaModelConstraintProvider.dylib" /tmp/ios-arm64-simulator/CLiteRTLM.framework/CLiteRTLM
 ```
 
 Copy headers (from the LiteRT-LM source `c/` directory):

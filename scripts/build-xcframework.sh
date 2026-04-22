@@ -171,6 +171,10 @@ package_framework() {
     # Copy extra dylib if present
     if [ -n "$EXTRA_DYLIB" ] && [ -f "$EXTRA_DYLIB" ]; then
         cp "$EXTRA_DYLIB" "$FW_DIR/"
+        install_name_tool \
+            -change "@rpath/$(basename "$EXTRA_DYLIB")" \
+            "@loader_path/$(basename "$EXTRA_DYLIB")" \
+            "$FW_DIR/$FRAMEWORK_NAME"
     fi
 
     # Copy headers
