@@ -142,7 +142,9 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             let createdEngine = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<OpaquePointer, any Error>) in
                 self.inferenceQueue.async {
                     do {
-                        litert_lm_set_min_log_level(1)
+                        // Keep the native LiteRT runtime quiet so app-level
+                        // branch and pipeline logs remain readable.
+                        litert_lm_set_min_log_level(2)
 
                         guard let settings = litert_lm_engine_settings_create(
                             path, backendStr, backendStr, backendStr
@@ -490,6 +492,24 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         }
     }
 
+    /// Close the persistent session and wait until the engine queue finishes.
+    public func closeSessionAndWait() async {
+        await withCheckedContinuation { continuation in
+            inferenceQueue.async { [self] in
+                if let s = chatSession {
+                    logSessionBenchmark(s)
+                    litert_lm_session_delete(s)
+                    chatSession = nil
+                }
+                if let c = chatSessionConfig {
+                    litert_lm_session_config_delete(c)
+                    chatSessionConfig = nil
+                }
+                continuation.resume()
+            }
+        }
+    }
+
     // MARK: - Persistent Conversation (Multi-turn Multimodal)
 
     /// Open a persistent Conversation for multi-turn text and multimodal turns.
@@ -577,6 +597,28 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                 chatSessionConfig = nil
             }
             Self.log.info("Persistent conversation closed")
+        }
+    }
+
+    /// Close the persistent conversation and wait until the engine queue finishes.
+    public func closeConversationAndWait() async {
+        await withCheckedContinuation { continuation in
+            inferenceQueue.async { [self] in
+                if let c = chatConversation {
+                    logConversationBenchmark(c)
+                    litert_lm_conversation_delete(c)
+                    chatConversation = nil
+                }
+                if let c = chatConversationConfig {
+                    litert_lm_conversation_config_delete(c)
+                    chatConversationConfig = nil
+                }
+                if let c = chatSessionConfig {
+                    litert_lm_session_config_delete(c)
+                    chatSessionConfig = nil
+                }
+                continuation.resume()
+            }
         }
     }
 
@@ -1526,18 +1568,15 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         let numDecode = litert_lm_benchmark_info_get_num_decode_turns(info)
         let numPrefill = litert_lm_benchmark_info_get_num_prefill_turns(info)
 
-        Self.log.info("Benchmark: init=\(String(format: "%.2f", initTime))s, TTFT=\(String(format: "%.2f", ttft))s")
-
-        for i in 0..<numPrefill {
-            let tps = litert_lm_benchmark_info_get_prefill_tokens_per_sec_at(info, Int32(i))
-            let count = litert_lm_benchmark_info_get_prefill_token_count_at(info, Int32(i))
-            Self.log.info("  Prefill[\(i)]: \(count) tokens @ \(String(format: "%.1f", tps)) tok/s")
+        let totalPrefillTokens = (0..<numPrefill).reduce(0) { partialResult, index in
+            partialResult + Int(litert_lm_benchmark_info_get_prefill_token_count_at(info, Int32(index)))
         }
-        for i in 0..<numDecode {
-            let tps = litert_lm_benchmark_info_get_decode_tokens_per_sec_at(info, Int32(i))
-            let count = litert_lm_benchmark_info_get_decode_token_count_at(info, Int32(i))
-            Self.log.info("  Decode[\(i)]: \(count) tokens @ \(String(format: "%.1f", tps)) tok/s")
+        let totalDecodeTokens = (0..<numDecode).reduce(0) { partialResult, index in
+            partialResult + Int(litert_lm_benchmark_info_get_decode_token_count_at(info, Int32(index)))
         }
+        Self.log.info(
+            "Session benchmark: init=\(String(format: "%.2f", initTime))s ttft=\(String(format: "%.2f", ttft))s prefillTurns=\(numPrefill) prefillTokens=\(totalPrefillTokens) decodeTurns=\(numDecode) decodeTokens=\(totalDecodeTokens)"
+        )
     }
 
     private func logConversationBenchmark(_ conversation: OpaquePointer) {
@@ -1549,18 +1588,15 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         let numDecode = litert_lm_benchmark_info_get_num_decode_turns(info)
         let numPrefill = litert_lm_benchmark_info_get_num_prefill_turns(info)
 
-        Self.log.info("Conversation benchmark: init=\(String(format: "%.2f", initTime))s, TTFT=\(String(format: "%.2f", ttft))s")
-
-        for i in 0..<numPrefill {
-            let tps = litert_lm_benchmark_info_get_prefill_tokens_per_sec_at(info, Int32(i))
-            let count = litert_lm_benchmark_info_get_prefill_token_count_at(info, Int32(i))
-            Self.log.info("  Prefill[\(i)]: \(count) tokens @ \(String(format: "%.1f", tps)) tok/s")
+        let totalPrefillTokens = (0..<numPrefill).reduce(0) { partialResult, index in
+            partialResult + Int(litert_lm_benchmark_info_get_prefill_token_count_at(info, Int32(index)))
         }
-        for i in 0..<numDecode {
-            let tps = litert_lm_benchmark_info_get_decode_tokens_per_sec_at(info, Int32(i))
-            let count = litert_lm_benchmark_info_get_decode_token_count_at(info, Int32(i))
-            Self.log.info("  Decode[\(i)]: \(count) tokens @ \(String(format: "%.1f", tps)) tok/s")
+        let totalDecodeTokens = (0..<numDecode).reduce(0) { partialResult, index in
+            partialResult + Int(litert_lm_benchmark_info_get_decode_token_count_at(info, Int32(index)))
         }
+        Self.log.info(
+            "Conversation benchmark: init=\(String(format: "%.2f", initTime))s ttft=\(String(format: "%.2f", ttft))s prefillTurns=\(numPrefill) prefillTokens=\(totalPrefillTokens) decodeTurns=\(numDecode) decodeTokens=\(totalDecodeTokens)"
+        )
     }
 
     // MARK: - Private: Conversation-based Inference (Vision / Audio / Multimodal)
