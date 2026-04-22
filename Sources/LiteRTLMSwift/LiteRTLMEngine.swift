@@ -466,7 +466,6 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                     )
                     chatSession = session
                     chatSessionConfig = config
-                    Self.log.info("Persistent session opened")
                     cont.resume()
                 } catch {
                     cont.resume(throwing: error)
@@ -488,7 +487,6 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                 litert_lm_session_config_delete(c)
                 chatSessionConfig = nil
             }
-            Self.log.info("Persistent session closed")
         }
     }
 
@@ -571,7 +569,6 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                     chatSessionConfig = sessionConfig
                     chatConversationConfig = conversationConfig
                     chatConversation = conversation
-                    Self.log.info("Persistent conversation opened")
                     cont.resume()
                 } catch {
                     cont.resume(throwing: error)
@@ -596,7 +593,6 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                 litert_lm_session_config_delete(c)
                 chatSessionConfig = nil
             }
-            Self.log.info("Persistent conversation closed")
         }
     }
 
@@ -651,7 +647,6 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                     )
                     deleteStoredConversationBranchLocked(branchID)
                     storedConversationBranches[branchID] = conversation
-                    Self.log.info("Stored conversation branch: \(branchID, privacy: .public)")
                     cont.resume()
                 } catch {
                     cont.resume(throwing: error)
@@ -674,7 +669,6 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                     let clone = try cloneConversationHandle(conversation)
                     deleteStoredConversationBranchLocked(branchID)
                     storedConversationBranches[branchID] = clone
-                    Self.log.info("Saved persistent conversation branch: \(branchID, privacy: .public)")
                     cont.resume()
                 } catch {
                     cont.resume(throwing: error)
@@ -702,9 +696,6 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                     let clone = try cloneConversationHandle(source)
                     deleteStoredConversationBranchLocked(targetBranchID)
                     storedConversationBranches[targetBranchID] = clone
-                    Self.log.info(
-                        "Cloned conversation branch \(sourceBranchID, privacy: .public) -> \(targetBranchID, privacy: .public)"
-                    )
                     cont.resume()
                 } catch {
                     cont.resume(throwing: error)
@@ -743,7 +734,6 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                         chatSession = nil
                     }
                     chatConversation = clone
-                    Self.log.info("Activated conversation branch: \(branchID, privacy: .public)")
                     cont.resume()
                 } catch {
                     cont.resume(throwing: error)
@@ -1560,43 +1550,11 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     }
 
     private func logSessionBenchmark(_ session: OpaquePointer) {
-        guard let info = litert_lm_session_get_benchmark_info(session) else { return }
-        defer { litert_lm_benchmark_info_delete(info) }
-
-        let initTime = litert_lm_benchmark_info_get_total_init_time_in_second(info)
-        let ttft = litert_lm_benchmark_info_get_time_to_first_token(info)
-        let numDecode = litert_lm_benchmark_info_get_num_decode_turns(info)
-        let numPrefill = litert_lm_benchmark_info_get_num_prefill_turns(info)
-
-        let totalPrefillTokens = (0..<numPrefill).reduce(0) { partialResult, index in
-            partialResult + Int(litert_lm_benchmark_info_get_prefill_token_count_at(info, Int32(index)))
-        }
-        let totalDecodeTokens = (0..<numDecode).reduce(0) { partialResult, index in
-            partialResult + Int(litert_lm_benchmark_info_get_decode_token_count_at(info, Int32(index)))
-        }
-        Self.log.info(
-            "Session benchmark: init=\(String(format: "%.2f", initTime))s ttft=\(String(format: "%.2f", ttft))s prefillTurns=\(numPrefill) prefillTokens=\(totalPrefillTokens) decodeTurns=\(numDecode) decodeTokens=\(totalDecodeTokens)"
-        )
+        _ = session
     }
 
     private func logConversationBenchmark(_ conversation: OpaquePointer) {
-        guard let info = litert_lm_conversation_get_benchmark_info(conversation) else { return }
-        defer { litert_lm_benchmark_info_delete(info) }
-
-        let initTime = litert_lm_benchmark_info_get_total_init_time_in_second(info)
-        let ttft = litert_lm_benchmark_info_get_time_to_first_token(info)
-        let numDecode = litert_lm_benchmark_info_get_num_decode_turns(info)
-        let numPrefill = litert_lm_benchmark_info_get_num_prefill_turns(info)
-
-        let totalPrefillTokens = (0..<numPrefill).reduce(0) { partialResult, index in
-            partialResult + Int(litert_lm_benchmark_info_get_prefill_token_count_at(info, Int32(index)))
-        }
-        let totalDecodeTokens = (0..<numDecode).reduce(0) { partialResult, index in
-            partialResult + Int(litert_lm_benchmark_info_get_decode_token_count_at(info, Int32(index)))
-        }
-        Self.log.info(
-            "Conversation benchmark: init=\(String(format: "%.2f", initTime))s ttft=\(String(format: "%.2f", ttft))s prefillTurns=\(numPrefill) prefillTokens=\(totalPrefillTokens) decodeTurns=\(numDecode) decodeTokens=\(totalDecodeTokens)"
-        )
+        _ = conversation
     }
 
     // MARK: - Private: Conversation-based Inference (Vision / Audio / Multimodal)

@@ -239,7 +239,7 @@ for try await chunk in engine.sessionGenerateStreaming(
 engine.closeSession()
 ```
 
-### Conversation Branching (Shared Base Prefill)
+### Conversation Branching (Shared Base / Template Prefill)
 
 If your app has multiple page-specific assistants that all share a common base
 context, prewarm that base once, store it as a branch, then clone from it:
@@ -268,6 +268,17 @@ try await engine.activateConversationBranch("project")
 This is the recommended pattern for apps that need fast switching between
 multiple conversation personas or workspaces while staying on the Conversation
 API.
+
+A useful variant is a **shared blank template**:
+
+- prewarm one hidden branch for a reusable "blank chat" or "blank project"
+  shape
+- activate that template for fast first-entry warmup
+- on the first real user turn, clone the template into the workspace's real
+  stored branch and continue there
+
+That keeps first-use latency low without forcing every untouched new workspace
+to consume its own long-lived stored branch immediately.
 
 ### Download Progress Tracking
 
