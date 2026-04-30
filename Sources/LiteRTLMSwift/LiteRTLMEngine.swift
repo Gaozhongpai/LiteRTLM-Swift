@@ -45,28 +45,22 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     /// A piece of input for a persistent session turn.
     ///
     /// Use with `sessionGenerateStreaming(inputs:)` to send mixed text and audio
-    /// in a single user turn while reusing the session's KV cache. For raw
-    /// audio bytes, prefer `sessionPreprocessAudio(_:)` and then pass the
-    /// result as `.preprocessedAudio(...)`.
+    /// in a single user turn while reusing the session's KV cache.
     public enum SessionInput: Sendable {
         case text(String)
         case audio(Data)
         case preprocessedAudio(SessionPreprocessedAudio)
     }
 
-    /// A session-ready audio payload created by `sessionPreprocessAudio(_:)`.
-    ///
-    /// This is tied to the current persistent session's model configuration and
-    /// can be reused in `sessionGenerateStreaming(inputs:)`.
+    /// A compatibility wrapper for audio payloads created by
+    /// `sessionPreprocessAudio(_:)`. Official LiteRT-LM currently accepts raw
+    /// audio input directly through the session API, so this stores the original
+    /// bytes instead of a native preprocessed handle.
     public final class SessionPreprocessedAudio: @unchecked Sendable {
-        fileprivate let handle: OpaquePointer
+        fileprivate let data: Data
 
-        fileprivate init(handle: OpaquePointer) {
-            self.handle = handle
-        }
-
-        deinit {
-            litert_lm_preprocessed_audio_delete(handle)
+        fileprivate init(data: Data) {
+            self.data = data
         }
     }
 
@@ -1018,8 +1012,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                 let statePtr = Unmanaged.passRetained(state).toOpaque()
 
                 let result = input.withCString { textPtr -> Int32 in
-                    var inputData = InputData(
-                        type: kInputText,
+                    var inputData = LiteRtLmInputData(
+                        type: kLiteRtLmInputDataTypeText,
                         data: UnsafeRawPointer(textPtr),
                         size: strlen(textPtr)
                     )
@@ -1121,7 +1115,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
                 // Build C InputData structs. NSData gives stable .bytes pointers
                 // that remain valid as long as the NSData objects are alive.
-                var cInputs: [InputData] = []
+                var cInputs: [LiteRtLmInputData] = []
                 cInputs.reserveCapacity(inputEntries.count)
                 var pinnedBuffers: [NSData] = []
                 var pinnedPreprocessedAudio: [SessionPreprocessedAudio] = []
@@ -1132,27 +1126,29 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                         nullTerminated.append(0)
                         let nsData = nullTerminated as NSData
                         pinnedBuffers.append(nsData)
-                        cInputs.append(InputData(
-                            type: kInputText,
+                        cInputs.append(LiteRtLmInputData(
+                            type: kLiteRtLmInputDataTypeText,
                             data: nsData.bytes,
                             size: nsData.length - 1
                         ))
                     case .rawAudio(let data):
                         let nsData = data as NSData
                         pinnedBuffers.append(nsData)
-                        cInputs.append(InputData(
-                            type: kInputAudio,
+                        cInputs.append(LiteRtLmInputData(
+                            type: kLiteRtLmInputDataTypeAudio,
                             data: data.isEmpty ? nil : nsData.bytes,
                             size: nsData.length
                         ))
                     case .audioEnd:
-                        cInputs.append(InputData(type: kInputAudioEnd, data: nil, size: 0))
+                        cInputs.append(LiteRtLmInputData(type: kLiteRtLmInputDataTypeAudioEnd, data: nil, size: 0))
                     case .preprocessedAudio(let processed):
+                        let nsData = processed.data as NSData
+                        pinnedBuffers.append(nsData)
                         pinnedPreprocessedAudio.append(processed)
-                        cInputs.append(InputData(
-                            type: kInputAudioPreprocessed,
-                            data: UnsafeRawPointer(processed.handle),
-                            size: 0
+                        cInputs.append(LiteRtLmInputData(
+                            type: kLiteRtLmInputDataTypeAudio,
+                            data: processed.data.isEmpty ? nil : nsData.bytes,
+                            size: nsData.length
                         ))
                     }
                 }
@@ -1210,36 +1206,17 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         }
     }
 
-    /// Preprocess raw audio bytes into a session-ready payload for mixed
-    /// text+audio turns sent via `sessionGenerateStreaming(inputs:)`.
-    ///
-    /// Call this after `openSession()` and before constructing the turn inputs.
+    /// Returns an audio payload for mixed text+audio turns sent via
+    /// `sessionGenerateStreaming(inputs:)`.
     public func sessionPreprocessAudio(_ audioData: Data) async throws -> SessionPreprocessedAudio {
         try ensureReady()
         guard !audioData.isEmpty else {
             throw LiteRTLMError.inferenceFailure("No audio data provided")
         }
-
-        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<SessionPreprocessedAudio, Error>) in
-            inferenceQueue.async { [self] in
-                guard let session = self.chatSession else {
-                    cont.resume(throwing: LiteRTLMError.inferenceFailure("No persistent session open — call openSession() first"))
-                    return
-                }
-
-                let handle: OpaquePointer? = audioData.withUnsafeBytes { rawBuffer in
-                    guard let baseAddress = rawBuffer.baseAddress else { return nil }
-                    return litert_lm_session_preprocess_audio(session, baseAddress, rawBuffer.count)
-                }
-
-                guard let handle else {
-                    cont.resume(throwing: LiteRTLMError.inferenceFailure("Failed to preprocess session audio"))
-                    return
-                }
-
-                cont.resume(returning: SessionPreprocessedAudio(handle: handle))
-            }
+        guard inferenceQueue.sync(execute: { self.chatSession != nil }) else {
+            throw LiteRTLMError.inferenceFailure("No persistent session open — call openSession() first")
         }
+        return SessionPreprocessedAudio(data: audioData)
     }
 
     /// Prefill the persistent session without requesting a new model response.
@@ -1258,8 +1235,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                     }
 
                     let result = input.withCString { textPtr -> Bool in
-                        var inputData = InputData(
-                            type: kInputText,
+                        var inputData = LiteRtLmInputData(
+                            type: kLiteRtLmInputDataTypeText,
                             data: UnsafeRawPointer(textPtr),
                             size: strlen(textPtr)
                         )
@@ -1304,8 +1281,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                     }
 
                     let output = prompt.withCString { textPtr -> String? in
-                        var input = InputData(
-                            type: kInputText,
+                        var input = LiteRtLmInputData(
+                            type: kLiteRtLmInputDataTypeText,
                             data: UnsafeRawPointer(textPtr),
                             size: strlen(textPtr)
                         )
@@ -1352,8 +1329,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                     let statePtr = Unmanaged.passRetained(state).toOpaque()
 
                     let result = prompt.withCString { textPtr -> Int32 in
-                        var input = InputData(
-                            type: kInputText,
+                        var input = LiteRtLmInputData(
+                            type: kLiteRtLmInputDataTypeText,
                             data: UnsafeRawPointer(textPtr),
                             size: strlen(textPtr)
                         )
@@ -1443,7 +1420,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
         litert_lm_session_config_set_max_output_tokens(sessionConfig, maxTokens)
         var samplerParams = LiteRtLmSamplerParams(
-            type: kTopP, top_k: 40, top_p: 0.95,
+            type: kLiteRtLmSamplerTypeTopP, top_k: 40, top_p: 0.95,
             temperature: temperature, seed: 0
         )
         litert_lm_session_config_set_sampler_params(sessionConfig, &samplerParams)
@@ -1461,20 +1438,28 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         let toolsContent = toolsJSON?.trimmingCharacters(in: .whitespacesAndNewlines)
         let historyContent = historyJSON?.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        return Self.withOptionalCString(systemContent) { systemPtr in
-            Self.withOptionalCString(toolsContent) { toolsPtr in
-                Self.withOptionalCString(historyContent) { historyPtr in
-                    litert_lm_conversation_config_create(
-                        eng,
-                        sessionConfig,
-                        systemPtr,
-                        toolsPtr,
-                        historyPtr,
-                        false
-                    )
-                }
+        guard let config = litert_lm_conversation_config_create() else {
+            return nil
+        }
+        litert_lm_conversation_config_set_session_config(config, sessionConfig)
+        litert_lm_conversation_config_set_enable_constrained_decoding(config, false)
+
+        Self.withOptionalCString(systemContent) { systemPtr in
+            if let systemPtr {
+                litert_lm_conversation_config_set_system_message(config, systemPtr)
             }
         }
+        Self.withOptionalCString(toolsContent) { toolsPtr in
+            if let toolsPtr {
+                litert_lm_conversation_config_set_tools(config, toolsPtr)
+            }
+        }
+        Self.withOptionalCString(historyContent) { historyPtr in
+            if let historyPtr {
+                litert_lm_conversation_config_set_messages(config, historyPtr)
+            }
+        }
+        return config
     }
 
     private func createConversationHandle(
@@ -1510,16 +1495,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     }
 
     private func cloneConversationHandle(_ conversation: OpaquePointer) throws -> OpaquePointer {
-        typealias ConversationCloneFn = @convention(c) (OpaquePointer) -> OpaquePointer?
-        let symbolName = "litert_lm_conversation_clone"
-        let defaultHandle = UnsafeMutableRawPointer(bitPattern: -2)
-        guard let symbol = dlsym(defaultHandle, symbolName) else {
-            throw LiteRTLMError.featureUnavailable(
-                "Conversation cloning requires a rebuilt CLiteRTLM.xcframework that exports \(symbolName)."
-            )
-        }
-        let cloneFn = unsafeBitCast(symbol, to: ConversationCloneFn.self)
-        guard let cloned = cloneFn(conversation) else {
+        guard let cloned = litert_lm_conversation_clone(conversation) else {
             throw LiteRTLMError.inferenceFailure("Failed to clone conversation")
         }
         return cloned
@@ -1583,17 +1559,17 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                     }
                     litert_lm_session_config_set_max_output_tokens(sessionConfig, Int32(maxTokens))
                     var samplerParams = LiteRtLmSamplerParams(
-                        type: kTopP, top_k: 40, top_p: 0.95,
+                        type: kLiteRtLmSamplerTypeTopP, top_k: 40, top_p: 0.95,
                         temperature: temperature, seed: 0
                     )
                     litert_lm_session_config_set_sampler_params(sessionConfig, &samplerParams)
 
-                    guard let convConfig = litert_lm_conversation_config_create(
-                        eng, sessionConfig, nil, nil, nil, false
-                    ) else {
+                    guard let convConfig = litert_lm_conversation_config_create() else {
                         litert_lm_session_config_delete(sessionConfig)
                         throw LiteRTLMError.inferenceFailure("Failed to create conversation config")
                     }
+                    litert_lm_conversation_config_set_session_config(convConfig, sessionConfig)
+                    litert_lm_conversation_config_set_enable_constrained_decoding(convConfig, false)
 
                     guard let conversation = litert_lm_conversation_create(eng, convConfig) else {
                         litert_lm_conversation_config_delete(convConfig)
