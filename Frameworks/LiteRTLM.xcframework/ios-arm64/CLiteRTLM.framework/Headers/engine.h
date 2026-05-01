@@ -204,6 +204,17 @@ void litert_lm_conversation_config_set_filter_channel_content_from_kv_cache(
     LiteRtLmConversationConfig* config,
     bool filter_channel_content_from_kv_cache);
 
+// Sets whether the conversation should prefill the preface (system message,
+// tools, and history) into the KV cache during conversation creation. When
+// true, the prefill cost is paid up front by litert_lm_conversation_create;
+// the first user turn then only prefills the new turn. When false (default),
+// the entire context is prefilled on the first turn.
+// @param config The config to modify.
+// @param prefill_preface_on_init Whether to prefill the preface at init.
+LITERT_LM_C_API_EXPORT
+void litert_lm_conversation_config_set_prefill_preface_on_init(
+    LiteRtLmConversationConfig* config, bool prefill_preface_on_init);
+
 // Destroys a LiteRT LM Conversation Config.
 // @param config The config to destroy.
 LITERT_LM_C_API_EXPORT

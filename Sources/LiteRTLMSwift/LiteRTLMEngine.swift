@@ -71,6 +71,11 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     /// Whether the engine is ready for inference (text, vision, and audio).
     public var isReady: Bool { status == .ready }
 
+    /// Whether the loaded backend supports `litert_lm_conversation_clone`.
+    /// Probed once at load time. SessionBasic returns false; SessionAdvanced
+    /// (when the model + execution manager support it) returns true.
+    public private(set) var supportsConversationClone: Bool = false
+
     private let modelPath: URL
     private let backend: String
 
@@ -170,6 +175,12 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
             inferenceQueue.sync { self.engine = createdEngine }
 
+            let cloneSupported = inferenceQueue.sync {
+                Self.probeConversationCloneSupport(engine: createdEngine)
+            }
+            inferenceQueue.sync { self.supportsConversationClone = cloneSupported }
+            Self.log.info("Conversation clone supported: \(cloneSupported)")
+
             let elapsed = CFAbsoluteTimeGetCurrent() - startTime
             Self.log.info("Model loaded in \(String(format: "%.1f", elapsed))s")
             status = .ready
@@ -208,6 +219,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             if let eng = engine { litert_lm_engine_delete(eng) }
             engine = nil
         }
+        supportsConversationClone = false
         status = .notLoaded
         Self.log.info("Model unloaded")
     }
@@ -1443,6 +1455,13 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         }
         litert_lm_conversation_config_set_session_config(config, sessionConfig)
         litert_lm_conversation_config_set_enable_constrained_decoding(config, false)
+        // Eagerly prefill system prompt + tools + history into the KV cache at
+        // conversation-create time. Without this, prewarmProjectChat only
+        // allocates structures; the model forward pass over the preface is
+        // deferred to the first user turn. With this on, prewarm pays the
+        // prefill cost up front so first-token latency drops to just the new
+        // turn's prefill + decode.
+        litert_lm_conversation_config_set_prefill_preface_on_init(config, true)
 
         Self.withOptionalCString(systemContent) { systemPtr in
             if let systemPtr {
@@ -1496,9 +1515,31 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
     private func cloneConversationHandle(_ conversation: OpaquePointer) throws -> OpaquePointer {
         guard let cloned = litert_lm_conversation_clone(conversation) else {
-            throw LiteRTLMError.inferenceFailure("Failed to clone conversation")
+            throw LiteRTLMError.inferenceFailure(
+                "Conversation clone unsupported by current session backend (likely SessionBasic). Check engine.supportsConversationClone before calling clone APIs."
+            )
         }
         return cloned
+    }
+
+    /// Probes whether the active engine backend implements `Session::Clone`.
+    /// SessionBasic does not override Clone, so the call returns null.
+    /// SessionAdvanced returns a real cloned conversation. Runs synchronously
+    /// on the inference queue; safe to call once at load time.
+    private static func probeConversationCloneSupport(engine eng: OpaquePointer) -> Bool {
+        guard let sessionConfig = litert_lm_session_config_create() else { return false }
+        defer { litert_lm_session_config_delete(sessionConfig) }
+
+        guard let conversationConfig = litert_lm_conversation_config_create() else { return false }
+        litert_lm_conversation_config_set_session_config(conversationConfig, sessionConfig)
+        defer { litert_lm_conversation_config_delete(conversationConfig) }
+
+        guard let conversation = litert_lm_conversation_create(eng, conversationConfig) else { return false }
+        defer { litert_lm_conversation_delete(conversation) }
+
+        guard let cloned = litert_lm_conversation_clone(conversation) else { return false }
+        litert_lm_conversation_delete(cloned)
+        return true
     }
 
     private func deleteStoredConversationBranchLocked(_ branchID: String) {

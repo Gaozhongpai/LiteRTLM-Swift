@@ -6,7 +6,11 @@ Supports **text generation**, **vision (image understanding)**, **audio (speech/
 
 > **Note:** This is a community project, not an official Google product. The included `CLiteRTLM.xcframework` is built from Google's open-source [LiteRT-LM](https://github.com/google-ai-edge/LiteRT-LM) C API (Apache 2.0).
 >
-> **Advanced conversation branching:** the Swift source now includes branch-management APIs built around LiteRT-LM conversation cloning. To use them, rebuild `CLiteRTLM.xcframework` from the updated LiteRT-LM C API so the new `litert_lm_conversation_clone` symbol is present.
+> **Advanced conversation branching:** the Swift source now includes branch-management APIs built around LiteRT-LM conversation cloning. To use them, rebuild `CLiteRTLM.xcframework` from the updated LiteRT-LM C API so the `litert_lm_conversation_clone` and `litert_lm_conversation_config_set_prefill_preface_on_init` symbols are present.
+>
+> Cloning is implemented by `SessionAdvanced` only — `SessionBasic` returns `UnimplementedError`. The Swift engine probes once at `load()` and exposes the result as `engine.supportsConversationClone`. Gate any branch-management calls on that flag; on `false`, fall back to opening a fresh conversation per chat.
+>
+> **Eager preface prefill:** every `openConversation` and `openConversationBranch` now opts into `prefill_preface_on_init=true`. The model forward pass over the system prompt + history runs at conversation-create time, so prewarms actually warm the KV cache and the first user turn pays only the new turn's prefill. Empty prefaces are a no-op.
 
 ## Requirements
 
@@ -244,6 +248,11 @@ engine.closeSession()
 If your app has multiple page-specific assistants that all share a common base
 context, prewarm that base once, store it as a branch, then clone from it:
 
+> Branch-management APIs require a backend that implements `Session::Clone` —
+> at the time of writing only `SessionAdvanced` does. Check
+> `engine.supportsConversationClone` before calling these APIs and fall back to
+> per-chat `openConversation` when it is `false`.
+
 ```swift
 // Open and prewarm a reusable base conversation branch.
 try await engine.openConversationBranch(
@@ -383,6 +392,7 @@ struct EngineView: View {
 |----------|------|-------------|
 | `status` | `Status` | `.notLoaded`, `.loading`, `.ready`, or `.error(String)` |
 | `isReady` | `Bool` | Whether the engine is ready for inference |
+| `supportsConversationClone` | `Bool` | Whether the loaded backend implements `Session::Clone`. Probed once at `load()`. `false` on `SessionBasic`. Branch-management APIs (`saveConversationBranch`, `cloneConversationBranch`, `activateConversationBranch`) require `true` |
 
 ### ModelDownloader
 

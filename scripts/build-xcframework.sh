@@ -45,6 +45,8 @@ if [ ! -f "$LITERT_LM_DIR/c/BUILD" ]; then
     error "Invalid LiteRT-LM source directory: $LITERT_LM_DIR (missing c/BUILD)"
 fi
 
+LITERT_LM_DIR="$(cd "$LITERT_LM_DIR" && pwd)"
+
 info "Using LiteRT-LM source at: $LITERT_LM_DIR"
 
 # ---------------------------------------------------------------------------
