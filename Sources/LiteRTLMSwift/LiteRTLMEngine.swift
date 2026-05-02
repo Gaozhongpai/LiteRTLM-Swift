@@ -80,9 +80,14 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     private let backend: String
 
     private var engine: OpaquePointer?  // LiteRtLmEngine*
-    private let inferenceQueue = DispatchQueue(label: "com.litertlm.inference", qos: .userInitiated)
+    private var didWarmTextDecode = false
+    // The LiteRT-LM C runtime invokes streaming callbacks from its own worker
+    // threads. Keep this coordinating queue at default QoS so its semaphore
+    // wait does not create a user-initiated -> default priority inversion.
+    private let inferenceQueue = DispatchQueue(label: "com.litertlm.inference", qos: .default)
 
     private static let log = Logger(subsystem: "LiteRTLMSwift", category: "Engine")
+    private static let benchmarkLogsEnabled = false
 
     // MARK: - Init
 
@@ -158,7 +163,9 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                         try? FileManager.default.createDirectory(atPath: cacheDir, withIntermediateDirectories: true)
                         litert_lm_engine_settings_set_cache_dir(settings, cacheDir)
 
-                        litert_lm_engine_settings_enable_benchmark(settings)
+                        if Self.benchmarkLogsEnabled {
+                            litert_lm_engine_settings_enable_benchmark(settings)
+                        }
 
                         guard let createdEngine = litert_lm_engine_create(settings) else {
                             litert_lm_engine_settings_delete(settings)
@@ -173,7 +180,10 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                 }
             }
 
-            inferenceQueue.sync { self.engine = createdEngine }
+            inferenceQueue.sync {
+                self.engine = createdEngine
+                self.didWarmTextDecode = false
+            }
 
             let cloneSupported = inferenceQueue.sync {
                 Self.probeConversationCloneSupport(engine: createdEngine)
@@ -218,6 +228,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             storedConversationBranches.removeAll()
             if let eng = engine { litert_lm_engine_delete(eng) }
             engine = nil
+            didWarmTextDecode = false
         }
         supportsConversationClone = false
         status = .notLoaded
@@ -1272,6 +1283,56 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         }
     }
 
+    /// Run a tiny throwaway decode so the first real streamed response does not
+    /// have to initialize decode-side runtime state on the user path.
+    public func warmUpTextDecodeIfNeeded() async throws {
+        try ensureReady()
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            self.inferenceQueue.async { [self] in
+                do {
+                    guard !self.didWarmTextDecode else {
+                        continuation.resume()
+                        return
+                    }
+                    guard let eng = self.engine else { throw LiteRTLMError.modelNotLoaded }
+
+                    let (session, sessionConfig) = try self.createSession(
+                        engine: eng,
+                        temperature: 0,
+                        maxTokens: 1
+                    )
+                    defer {
+                        litert_lm_session_delete(session)
+                        litert_lm_session_config_delete(sessionConfig)
+                    }
+
+                    let prompt = "<|turn>user\nHello<turn|>\n<|turn>model\n"
+                    let didGenerate = prompt.withCString { textPtr -> Bool in
+                        var input = LiteRtLmInputData(
+                            type: kLiteRtLmInputDataTypeText,
+                            data: UnsafeRawPointer(textPtr),
+                            size: strlen(textPtr)
+                        )
+                        guard let responses = litert_lm_session_generate_content(session, &input, 1) else {
+                            return false
+                        }
+                        litert_lm_responses_delete(responses)
+                        return true
+                    }
+
+                    guard didGenerate else {
+                        throw LiteRTLMError.inferenceFailure("Text decode warmup returned no output")
+                    }
+
+                    self.didWarmTextDecode = true
+                    continuation.resume()
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
     // MARK: - Private: Session-based Inference
 
     private func runSessionInference(
@@ -1969,12 +2030,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     }
 
     nonisolated static func buildTextMessageJSON(text: String) -> String {
-        let message: [String: Any] = ["role": "user", "content": text]
-        guard let jsonData = try? JSONSerialization.data(withJSONObject: message),
-              let jsonString = String(data: jsonData, encoding: .utf8) else {
-            return #"{"role":"user","content":""}"#
-        }
-        return jsonString
+        #"{"role":"user","content":"# + jsonStringLiteral(text) + "}"
     }
 
     /// Serialize tool declarations into the JSON array format the C API expects
@@ -2029,6 +2085,11 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     /// Parse a raw conversation response into either text or tool calls.
     /// Falls through to `.text(raw)` for any shape we don't recognize.
     nonisolated static func parseConversationTurn(_ json: String) -> ConversationTurn {
+        if !json.contains(#""tool_calls""#),
+           let text = fastExtractTextFromConversationResponse(json) {
+            return .text(text)
+        }
+
         guard let data = json.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return .text(json.trimmingCharacters(in: .whitespacesAndNewlines))
@@ -2087,6 +2148,10 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     }
 
     nonisolated static func extractTextFromConversationResponse(_ json: String) -> String {
+        if let text = fastExtractTextFromConversationResponse(json) {
+            return text
+        }
+
         guard let data = json.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return json.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2108,6 +2173,107 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         if let text = obj["text"] as? String { return text }
 
         return json.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private nonisolated static func fastExtractTextFromConversationResponse(_ json: String) -> String? {
+        if let text = fastExtractJSONStringField("text", in: json) {
+            return text
+        }
+        if let text = fastExtractJSONStringField("content", in: json) {
+            return text
+        }
+        return nil
+    }
+
+    private nonisolated static func fastExtractJSONStringField(_ key: String, in json: String) -> String? {
+        let quotedKey = "\"\(key)\""
+        var searchStart = json.startIndex
+        while let keyRange = json.range(of: quotedKey, range: searchStart..<json.endIndex) {
+            var cursor = keyRange.upperBound
+            skipJSONWhitespace(in: json, cursor: &cursor)
+            guard cursor < json.endIndex, json[cursor] == ":" else {
+                searchStart = keyRange.upperBound
+                continue
+            }
+            cursor = json.index(after: cursor)
+            skipJSONWhitespace(in: json, cursor: &cursor)
+            guard cursor < json.endIndex, json[cursor] == "\"" else {
+                searchStart = keyRange.upperBound
+                continue
+            }
+
+            let valueQuoteStart = cursor
+            let valueStart = json.index(after: cursor)
+            cursor = valueStart
+            var isEscaped = false
+            var hasEscapes = false
+            while cursor < json.endIndex {
+                let char = json[cursor]
+                if isEscaped {
+                    isEscaped = false
+                } else if char == "\\" {
+                    isEscaped = true
+                    hasEscapes = true
+                } else if char == "\"" {
+                    if !hasEscapes {
+                        return String(json[valueStart..<cursor])
+                    }
+                    return decodeJSONStringLiteral(json[valueQuoteStart...cursor])
+                }
+                cursor = json.index(after: cursor)
+            }
+            return nil
+        }
+        return nil
+    }
+
+    private nonisolated static func skipJSONWhitespace(in json: String, cursor: inout String.Index) {
+        while cursor < json.endIndex {
+            switch json[cursor] {
+            case " ", "\n", "\r", "\t":
+                cursor = json.index(after: cursor)
+            default:
+                return
+            }
+        }
+    }
+
+    private nonisolated static func decodeJSONStringLiteral(_ literal: Substring) -> String? {
+        let payload = #"{"value":"# + literal + "}"
+        guard let data = payload.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: String] else {
+            return nil
+        }
+        return obj["value"]
+    }
+
+    private nonisolated static func jsonStringLiteral(_ text: String) -> String {
+        var output = "\""
+        output.reserveCapacity(text.count + 2)
+        for scalar in text.unicodeScalars {
+            switch scalar.value {
+            case 0x22:
+                output += "\\\""
+            case 0x5C:
+                output += "\\\\"
+            case 0x08:
+                output += "\\b"
+            case 0x0C:
+                output += "\\f"
+            case 0x0A:
+                output += "\\n"
+            case 0x0D:
+                output += "\\r"
+            case 0x09:
+                output += "\\t"
+            case 0x00...0x1F:
+                output += String(format: "\\u%04X", scalar.value)
+            default:
+                output.unicodeScalars.append(scalar)
+            }
+        }
+        output += "\""
+        return output
     }
 }
 
