@@ -247,11 +247,14 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     public func generate(
         prompt: String,
         temperature: Float = 0.7,
-        maxTokens: Int = 512
+        maxTokens: Int = 512,
+        topK: Int = 40,
+        topP: Float = 0.95
     ) async throws -> String {
         try ensureReady()
         return try await runSessionInference(
-            prompt: prompt, temperature: temperature, maxTokens: Int32(maxTokens)
+            prompt: prompt, temperature: temperature, maxTokens: Int32(maxTokens),
+            topK: Int32(topK), topP: topP
         )
     }
 
@@ -268,10 +271,13 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     public func generateStreaming(
         prompt: String,
         temperature: Float = 0.7,
-        maxTokens: Int = 512
+        maxTokens: Int = 512,
+        topK: Int = 40,
+        topP: Float = 0.95
     ) -> AsyncThrowingStream<String, Error> {
         runSessionInferenceStreaming(
-            prompt: prompt, temperature: temperature, maxTokens: Int32(maxTokens)
+            prompt: prompt, temperature: temperature, maxTokens: Int32(maxTokens),
+            topK: Int32(topK), topP: topP
         )
     }
 
@@ -295,6 +301,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         prompt: String,
         temperature: Float = 0.7,
         maxTokens: Int = 512,
+        topK: Int = 40,
+        topP: Float = 0.95,
         maxImageDimension: Int = 1024
     ) async throws -> String {
         try ensureReady()
@@ -309,7 +317,9 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             messageJSON: payload.messageJSON,
             tempURLs: payload.tempURLs,
             temperature: temperature,
-            maxTokens: maxTokens
+            maxTokens: maxTokens,
+            topK: topK,
+            topP: topP
         )
     }
 
@@ -327,6 +337,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         prompt: String,
         temperature: Float = 0.7,
         maxTokens: Int = 1024,
+        topK: Int = 40,
+        topP: Float = 0.95,
         maxImageDimension: Int = 1024
     ) async throws -> String {
         try ensureReady()
@@ -344,7 +356,9 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             messageJSON: payload.messageJSON,
             tempURLs: payload.tempURLs,
             temperature: temperature,
-            maxTokens: maxTokens
+            maxTokens: maxTokens,
+            topK: topK,
+            topP: topP
         )
     }
 
@@ -372,7 +386,9 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         prompt: String,
         format: AudioFormat = .wav,
         temperature: Float = 0.7,
-        maxTokens: Int = 512
+        maxTokens: Int = 512,
+        topK: Int = 40,
+        topP: Float = 0.95
     ) async throws -> String {
         try ensureReady()
         guard !audioData.isEmpty else {
@@ -389,7 +405,9 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             messageJSON: payload.messageJSON,
             tempURLs: payload.tempURLs,
             temperature: temperature,
-            maxTokens: maxTokens
+            maxTokens: maxTokens,
+            topK: topK,
+            topP: topP
         )
     }
 
@@ -413,6 +431,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         prompt: String,
         temperature: Float = 0.7,
         maxTokens: Int = 1024,
+        topK: Int = 40,
+        topP: Float = 0.95,
         maxImageDimension: Int = 1024
     ) async throws -> String {
         try ensureReady()
@@ -430,7 +450,9 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             messageJSON: payload.messageJSON,
             tempURLs: payload.tempURLs,
             temperature: temperature,
-            maxTokens: maxTokens
+            maxTokens: maxTokens,
+            topK: topK,
+            topP: topP
         )
     }
 
@@ -455,7 +477,12 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     /// - Parameters:
     ///   - temperature: Sampling temperature. Default 0.3.
     ///   - maxTokens: Maximum tokens per generation. Default 512.
-    public func openSession(temperature: Float = 0.3, maxTokens: Int = 512) async throws {
+    public func openSession(
+        temperature: Float = 0.3,
+        maxTokens: Int = 512,
+        topK: Int = 40,
+        topP: Float = 0.95
+    ) async throws {
         try ensureReady()
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             inferenceQueue.async { [self] in
@@ -479,7 +506,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
                     guard let eng = engine else { throw LiteRTLMError.modelNotLoaded }
                     let (session, config) = try createSession(
-                        engine: eng, temperature: temperature, maxTokens: Int32(maxTokens)
+                        engine: eng, temperature: temperature, maxTokens: Int32(maxTokens),
+                        topK: Int32(topK), topP: topP
                     )
                     chatSession = session
                     chatSessionConfig = config
@@ -538,7 +566,9 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         historyJSON: String? = nil,
         tools: [ToolDeclaration] = [],
         temperature: Float = 0.3,
-        maxTokens: Int = 512
+        maxTokens: Int = 512,
+        topK: Int = 40,
+        topP: Float = 0.95
     ) async throws {
         try ensureReady()
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
@@ -564,7 +594,9 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                     guard let eng = engine else { throw LiteRTLMError.modelNotLoaded }
                     let sessionConfig = try createSessionConfig(
                         temperature: temperature,
-                        maxTokens: Int32(maxTokens)
+                        maxTokens: Int32(maxTokens),
+                        topK: Int32(topK),
+                        topP: topP
                     )
                     let toolsJSON = Self.buildToolsJSON(tools)
                     guard let conversationConfig = createConversationConfig(
@@ -647,7 +679,9 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         historyJSON: String? = nil,
         tools: [ToolDeclaration] = [],
         temperature: Float = 0.3,
-        maxTokens: Int = 512
+        maxTokens: Int = 512,
+        topK: Int = 40,
+        topP: Float = 0.95
     ) async throws {
         try ensureReady()
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
@@ -660,7 +694,9 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                         historyJSON: historyJSON,
                         tools: tools,
                         temperature: temperature,
-                        maxTokens: maxTokens
+                        maxTokens: maxTokens,
+                        topK: topK,
+                        topP: topP
                     )
                     deleteStoredConversationBranchLocked(branchID)
                     storedConversationBranches[branchID] = conversation
@@ -1299,7 +1335,9 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                     let (session, sessionConfig) = try self.createSession(
                         engine: eng,
                         temperature: 0,
-                        maxTokens: 1
+                        maxTokens: 1,
+                        topK: 40,
+                        topP: 0.95
                     )
                     defer {
                         litert_lm_session_delete(session)
@@ -1338,7 +1376,9 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     private func runSessionInference(
         prompt: String,
         temperature: Float,
-        maxTokens: Int32
+        maxTokens: Int32,
+        topK: Int32,
+        topP: Float
     ) async throws -> String {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, any Error>) in
             self.inferenceQueue.async { [self] in
@@ -1346,7 +1386,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                     guard let eng = self.engine else { throw LiteRTLMError.modelNotLoaded }
 
                     let (session, sessionConfig) = try self.createSession(
-                        engine: eng, temperature: temperature, maxTokens: maxTokens
+                        engine: eng, temperature: temperature, maxTokens: maxTokens,
+                        topK: topK, topP: topP
                     )
                     defer {
                         litert_lm_session_delete(session)
@@ -1382,7 +1423,9 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     private func runSessionInferenceStreaming(
         prompt: String,
         temperature: Float,
-        maxTokens: Int32
+        maxTokens: Int32,
+        topK: Int32,
+        topP: Float
     ) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
             self.inferenceQueue.async { [self] in
@@ -1394,7 +1437,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                     }
 
                     let (session, sessionConfig) = try self.createSession(
-                        engine: eng, temperature: temperature, maxTokens: maxTokens
+                        engine: eng, temperature: temperature, maxTokens: maxTokens,
+                        topK: topK, topP: topP
                     )
 
                     let streamDone = DispatchSemaphore(value: 0)
@@ -1468,11 +1512,15 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     private func createSession(
         engine eng: OpaquePointer,
         temperature: Float,
-        maxTokens: Int32
+        maxTokens: Int32,
+        topK: Int32,
+        topP: Float
     ) throws -> (session: OpaquePointer, config: OpaquePointer) {
         let sessionConfig = try createSessionConfig(
             temperature: temperature,
-            maxTokens: maxTokens
+            maxTokens: maxTokens,
+            topK: topK,
+            topP: topP
         )
 
         guard let session = litert_lm_engine_create_session(eng, sessionConfig) else {
@@ -1485,7 +1533,9 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
     private func createSessionConfig(
         temperature: Float,
-        maxTokens: Int32
+        maxTokens: Int32,
+        topK: Int32,
+        topP: Float
     ) throws -> OpaquePointer {
         guard let sessionConfig = litert_lm_session_config_create() else {
             throw LiteRTLMError.inferenceFailure("Failed to create session config")
@@ -1493,7 +1543,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
         litert_lm_session_config_set_max_output_tokens(sessionConfig, maxTokens)
         var samplerParams = LiteRtLmSamplerParams(
-            type: kLiteRtLmSamplerTypeTopP, top_k: 40, top_p: 0.95,
+            type: kLiteRtLmSamplerTypeTopP, top_k: topK, top_p: topP,
             temperature: temperature, seed: 0
         )
         litert_lm_session_config_set_sampler_params(sessionConfig, &samplerParams)
@@ -1548,11 +1598,15 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         historyJSON: String?,
         tools: [ToolDeclaration],
         temperature: Float,
-        maxTokens: Int
+        maxTokens: Int,
+        topK: Int,
+        topP: Float
     ) throws -> OpaquePointer {
         let sessionConfig = try createSessionConfig(
             temperature: temperature,
-            maxTokens: Int32(maxTokens)
+            maxTokens: Int32(maxTokens),
+            topK: Int32(topK),
+            topP: topP
         )
         defer { litert_lm_session_config_delete(sessionConfig) }
 
@@ -1643,7 +1697,9 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         messageJSON: String,
         tempURLs: [URL],
         temperature: Float,
-        maxTokens: Int
+        maxTokens: Int,
+        topK: Int,
+        topP: Float
     ) async throws -> String {
         let urlsToCleanup = tempURLs
         return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, any Error>) in
@@ -1661,7 +1717,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                     }
                     litert_lm_session_config_set_max_output_tokens(sessionConfig, Int32(maxTokens))
                     var samplerParams = LiteRtLmSamplerParams(
-                        type: kLiteRtLmSamplerTypeTopP, top_k: 40, top_p: 0.95,
+                        type: kLiteRtLmSamplerTypeTopP, top_k: Int32(topK), top_p: topP,
                         temperature: temperature, seed: 0
                     )
                     litert_lm_session_config_set_sampler_params(sessionConfig, &samplerParams)
