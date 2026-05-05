@@ -1686,7 +1686,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             return nil
         }
         litert_lm_conversation_config_set_session_config(config, sessionConfig)
-        litert_lm_conversation_config_set_enable_constrained_decoding(config, false)
+        litert_lm_conversation_config_set_enable_constrained_decoding(config, toolsContent != nil)
         // Eagerly prefill system prompt + tools + history into the KV cache at
         // conversation-create time. Without this, prewarmProjectChat only
         // allocates structures; the model forward pass over the preface is
