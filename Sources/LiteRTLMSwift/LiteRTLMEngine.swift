@@ -96,8 +96,12 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     /// (when the model + execution manager support it) returns true.
     public private(set) var supportsConversationClone: Bool = false
 
+    /// Whether this engine load enabled LiteRT-LM speculative decoding.
+    public private(set) var isSpeculativeDecodingEnabled: Bool = false
+
     private let modelPath: URL
     private let backend: String
+    private let speculativeDecodingPreference: Bool?
     public let enabledModalities: EnabledModalities
 
     private var engine: OpaquePointer?  // LiteRtLmEngine*
@@ -109,6 +113,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
     private static let log = Logger(subsystem: "LiteRTLMSwift", category: "Engine")
     private static let benchmarkLogsEnabled = false
+    private static let mtpDrafterMarker = Data("tf_lite_mtp_drafter".utf8)
     private static let iOSGpuRuntimeDylibs = [
         "libLiteRtMetalAccelerator.dylib",
     ]
@@ -119,18 +124,21 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     /// - Parameters:
     ///   - modelPath: Path to the `.litertlm` model file on disk.
     ///   - backend: Main/text compute backend — `"cpu"` or `"gpu"` (GPU uses Metal on iOS).
-    ///     The audio encoder remains on CPU because Gemma 4 E2B's audio section
-    ///     is packaged with a CPU-only backend constraint.
+    ///     Vision and audio encoders remain on CPU because Gemma 4 E2B's
+    ///     non-text sections are packaged with backend constraints or GPU
+    ///     delegate ops that are not stable on iOS.
     ///   - enabledModalities: Optional non-text executors to configure at load
     ///     time. Use `.textOnly` for lower resident memory when the app already
     ///     converts speech/images before calling the LLM.
     public init(
         modelPath: URL,
         backend: String = "cpu",
+        enableSpeculativeDecoding: Bool? = nil,
         enabledModalities: EnabledModalities = .all
     ) {
         self.modelPath = modelPath
         self.backend = backend
+        self.speculativeDecodingPreference = enableSpeculativeDecoding
         self.enabledModalities = enabledModalities
     }
 
@@ -163,12 +171,15 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         guard status != .ready && status != .loading else { return }
 
         status = .loading
+        isSpeculativeDecodingEnabled = false
         Self.log.info("Loading model: \(self.modelPath.lastPathComponent), backend: \(self.backend), modalities: \(self.enabledModalities.logDescription)")
 
         let path = modelPath.path
         let backendStr = self.backend
-        let visionBackendStr: String? = enabledModalities.contains(.vision) ? backendStr : nil
+        let visionBackendStr: String? = enabledModalities.contains(.vision) ? "cpu" : nil
         let audioBackendStr: String? = enabledModalities.contains(.audio) ? "cpu" : nil
+        let enableSpeculativeDecoding = speculativeDecodingPreference
+            ?? Self.modelSupportsSpeculativeDecoding(path: path)
         let startTime = CFAbsoluteTimeGetCurrent()
 
         guard FileManager.default.fileExists(atPath: path) else {
@@ -208,6 +219,10 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
                         litert_lm_engine_settings_set_max_num_tokens(settings, 4096)
 
+                        if enableSpeculativeDecoding {
+                            litert_lm_engine_settings_set_enable_speculative_decoding(settings, true)
+                        }
+
                         let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
                             .appendingPathComponent("litertlm_cache").path
                         try? FileManager.default.createDirectory(atPath: cacheDir, withIntermediateDirectories: true)
@@ -234,12 +249,14 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                 self.engine = createdEngine
                 self.didWarmTextDecode = false
             }
+            isSpeculativeDecodingEnabled = enableSpeculativeDecoding
 
             let cloneSupported = inferenceQueue.sync {
                 Self.probeConversationCloneSupport(engine: createdEngine)
             }
             inferenceQueue.sync { self.supportsConversationClone = cloneSupported }
             Self.log.info("Conversation clone supported: \(cloneSupported)")
+            Self.log.info("Speculative decoding enabled: \(enableSpeculativeDecoding)")
 
             let elapsed = CFAbsoluteTimeGetCurrent() - startTime
             Self.log.info("Model loaded in \(String(format: "%.1f", elapsed))s")
@@ -248,8 +265,24 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             let msg = "Load failed: \(error.localizedDescription)"
             Self.log.error("\(msg)")
             status = .error(msg)
+            isSpeculativeDecodingEnabled = false
             throw error
         }
+    }
+
+    private static func modelSupportsSpeculativeDecoding(path: String) -> Bool {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return false }
+        defer {
+            try? handle.close()
+        }
+
+        // LiteRT-LM stores section metadata near the start of the package. Scan
+        // a bounded prefix so very large models are not read into memory.
+        let maxHeaderBytes = 16 * 1024 * 1024
+        guard let header = try? handle.read(upToCount: maxHeaderBytes) else {
+            return false
+        }
+        return header.range(of: mtpDrafterMarker) != nil
     }
 
     private static func preloadGpuRuntimeDylibsIfNeeded() {
@@ -321,6 +354,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             didWarmTextDecode = false
         }
         supportsConversationClone = false
+        isSpeculativeDecodingEnabled = false
         status = .notLoaded
         Self.log.info("Model unloaded")
     }
