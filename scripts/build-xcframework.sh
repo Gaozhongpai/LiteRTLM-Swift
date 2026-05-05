@@ -125,27 +125,33 @@ info "Restoring device build..."
 $BAZEL_CMD build "${BAZEL_XCODE_FLAGS[@]}" --config=ios_arm64 //c:libLiteRTLMEngine.dylib
 DEVICE_DYLIB="$LITERT_LM_DIR/bazel-bin/c/libLiteRTLMEngine.dylib"
 
-# Also grab the GemmaModelConstraintProvider dylib if present.
+# Also grab companion dylibs if present. LiteRT-LM loads the Metal GPU
+# accelerator and sampler dynamically at runtime, so they must be shipped next
+# to CLiteRTLM and copied into the app bundle's Frameworks directory.
 # Newer LiteRT-LM checkouts stage these in prebuilt/<platform>/ instead of
 # bazel-bin/c/.
-DEVICE_CONSTRAINT_DYLIB=""
-SIM_CONSTRAINT_DYLIB=""
+DEVICE_EXTRA_DYLIBS=()
+SIM_EXTRA_DYLIBS=()
 
-if [ -f "$LITERT_LM_DIR/prebuilt/ios_arm64/libGemmaModelConstraintProvider.dylib" ]; then
-    DEVICE_CONSTRAINT_DYLIB="$LITERT_LM_DIR/prebuilt/ios_arm64/libGemmaModelConstraintProvider.dylib"
-    info "Found device libGemmaModelConstraintProvider.dylib in prebuilt/ios_arm64"
-elif [ -f "$LITERT_LM_DIR/bazel-bin/c/libGemmaModelConstraintProvider.dylib" ]; then
-    DEVICE_CONSTRAINT_DYLIB="$LITERT_LM_DIR/bazel-bin/c/libGemmaModelConstraintProvider.dylib"
-    info "Found device libGemmaModelConstraintProvider.dylib in bazel-bin/c"
-fi
+collect_extra_dylib() {
+    local -n OUT_ARRAY="$1"
+    local PLATFORM_DIR="$2"
+    local NAME="$3"
 
-if [ -f "$LITERT_LM_DIR/prebuilt/ios_sim_arm64/libGemmaModelConstraintProvider.dylib" ]; then
-    SIM_CONSTRAINT_DYLIB="$LITERT_LM_DIR/prebuilt/ios_sim_arm64/libGemmaModelConstraintProvider.dylib"
-    info "Found simulator libGemmaModelConstraintProvider.dylib in prebuilt/ios_sim_arm64"
-elif [ -f "$LITERT_LM_DIR/bazel-bin/c/libGemmaModelConstraintProvider.dylib" ]; then
-    SIM_CONSTRAINT_DYLIB="$LITERT_LM_DIR/bazel-bin/c/libGemmaModelConstraintProvider.dylib"
-    info "Found simulator libGemmaModelConstraintProvider.dylib in bazel-bin/c"
-fi
+    if [ -f "$LITERT_LM_DIR/prebuilt/$PLATFORM_DIR/$NAME" ]; then
+        OUT_ARRAY+=("$LITERT_LM_DIR/prebuilt/$PLATFORM_DIR/$NAME")
+        info "Found $PLATFORM_DIR $NAME in prebuilt/$PLATFORM_DIR"
+    elif [ -f "$LITERT_LM_DIR/bazel-bin/c/$NAME" ]; then
+        OUT_ARRAY+=("$LITERT_LM_DIR/bazel-bin/c/$NAME")
+        info "Found $PLATFORM_DIR $NAME in bazel-bin/c"
+    fi
+}
+
+collect_extra_dylib DEVICE_EXTRA_DYLIBS ios_arm64 libGemmaModelConstraintProvider.dylib
+collect_extra_dylib DEVICE_EXTRA_DYLIBS ios_arm64 libLiteRtMetalAccelerator.dylib
+
+collect_extra_dylib SIM_EXTRA_DYLIBS ios_sim_arm64 libGemmaModelConstraintProvider.dylib
+collect_extra_dylib SIM_EXTRA_DYLIBS ios_sim_arm64 libLiteRtMetalAccelerator.dylib
 
 # ---------------------------------------------------------------------------
 # 5. Package as .framework bundles
@@ -159,7 +165,8 @@ MIN_IOS="13.0"
 package_framework() {
     local ARCH_NAME="$1"  # e.g. "ios-arm64"
     local DYLIB_PATH="$2"
-    local EXTRA_DYLIB="${3:-}"
+    shift 2
+    local EXTRA_DYLIBS=("$@")
     local FW_DIR="$WORK_DIR/$ARCH_NAME/$FRAMEWORK_NAME.framework"
 
     mkdir -p "$FW_DIR/Headers" "$FW_DIR/Modules"
@@ -170,14 +177,16 @@ package_framework() {
     # Fix install name
     install_name_tool -id "@rpath/$FRAMEWORK_NAME.framework/$FRAMEWORK_NAME" "$FW_DIR/$FRAMEWORK_NAME"
 
-    # Copy extra dylib if present
-    if [ -n "$EXTRA_DYLIB" ] && [ -f "$EXTRA_DYLIB" ]; then
+    # Copy extra dylibs if present. Linked companions use @loader_path; GPU
+    # plugins are also preloaded from Swift because LiteRT discovers them with
+    # dlopen at engine-creation time.
+    for EXTRA_DYLIB in "${EXTRA_DYLIBS[@]}"; do
         cp "$EXTRA_DYLIB" "$FW_DIR/"
         install_name_tool \
             -change "@rpath/$(basename "$EXTRA_DYLIB")" \
             "@loader_path/$(basename "$EXTRA_DYLIB")" \
-            "$FW_DIR/$FRAMEWORK_NAME"
-    fi
+            "$FW_DIR/$FRAMEWORK_NAME" || true
+    done
 
     # Copy headers
     cp "$HEADERS_DIR/engine.h" "$FW_DIR/Headers/"
@@ -219,19 +228,19 @@ PLIST
 
     # Sign nested code before the framework bundle so the framework's sealed
     # resources capture the final dylib hash.
-    if [ -n "$EXTRA_DYLIB" ] && [ -f "$FW_DIR/$(basename "$EXTRA_DYLIB")" ]; then
+    for EXTRA_DYLIB in "${EXTRA_DYLIBS[@]}"; do
         codesign --force --sign - "$FW_DIR/$(basename "$EXTRA_DYLIB")"
-    fi
+    done
     codesign --force --sign - "$FW_DIR/$FRAMEWORK_NAME"
 
     info "Packaged $ARCH_NAME framework at $FW_DIR"
 }
 
 info "Packaging device framework..."
-package_framework "ios-arm64" "$DEVICE_DYLIB" "$DEVICE_CONSTRAINT_DYLIB"
+package_framework "ios-arm64" "$DEVICE_DYLIB" "${DEVICE_EXTRA_DYLIBS[@]}"
 
 info "Packaging simulator framework..."
-package_framework "ios-arm64-simulator" "$SIM_DYLIB_COPY" "$SIM_CONSTRAINT_DYLIB"
+package_framework "ios-arm64-simulator" "$SIM_DYLIB_COPY" "${SIM_EXTRA_DYLIBS[@]}"
 
 # ---------------------------------------------------------------------------
 # 6. Create xcframework

@@ -88,13 +88,18 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
     private static let log = Logger(subsystem: "LiteRTLMSwift", category: "Engine")
     private static let benchmarkLogsEnabled = false
+    private static let iOSGpuRuntimeDylibs = [
+        "libLiteRtMetalAccelerator.dylib",
+    ]
 
     // MARK: - Init
 
     /// Create an engine instance.
     /// - Parameters:
     ///   - modelPath: Path to the `.litertlm` model file on disk.
-    ///   - backend: Compute backend — `"cpu"` or `"gpu"` (GPU uses Metal on iOS).
+    ///   - backend: Main/text compute backend — `"cpu"` or `"gpu"` (GPU uses Metal on iOS).
+    ///     The audio encoder remains on CPU because Gemma 4 E2B's audio section
+    ///     is packaged with a CPU-only backend constraint.
     public init(modelPath: URL, backend: String = "cpu") {
         self.modelPath = modelPath
         self.backend = backend
@@ -133,6 +138,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
         let path = modelPath.path
         let backendStr = self.backend
+        let audioBackendStr = "cpu"
         let startTime = CFAbsoluteTimeGetCurrent()
 
         guard FileManager.default.fileExists(atPath: path) else {
@@ -148,12 +154,26 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                     do {
                         // Keep the native LiteRT runtime quiet so app-level
                         // branch and pipeline logs remain readable.
-                        litert_lm_set_min_log_level(2)
+                        // LiteRT-LM levels: 0=verbose, 1=debug, 2=info,
+                        // 3=warning, 4=error, 5=fatal, 1000=silent.
+                        litert_lm_set_min_log_level(4)
+
+                        if backendStr.caseInsensitiveCompare("gpu") == .orderedSame {
+                            Self.preloadGpuRuntimeDylibsIfNeeded()
+                        }
 
                         guard let settings = litert_lm_engine_settings_create(
-                            path, backendStr, backendStr, backendStr
+                            path, backendStr, backendStr, audioBackendStr
                         ) else {
                             throw LiteRTLMError.engineCreationFailed("Failed to create engine settings")
+                        }
+
+                        if backendStr.caseInsensitiveCompare("gpu") == .orderedSame {
+                            // The C bridge defaults GPU text activations to FP32,
+                            // but LiteRT-LM's text default is FP16 and some iOS
+                            // GPU compiled-model paths fail at engine creation
+                            // with FP32.
+                            litert_lm_engine_settings_set_activation_data_type(settings, 1)
                         }
 
                         litert_lm_engine_settings_set_max_num_tokens(settings, 4096)
@@ -200,6 +220,40 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             status = .error(msg)
             throw error
         }
+    }
+
+    private static func preloadGpuRuntimeDylibsIfNeeded() {
+        #if canImport(Darwin)
+        guard let frameworkURL = cliteRTLMFrameworkURL() else {
+            log.warning("Could not locate CLiteRTLM.framework for GPU dylib preload")
+            return
+        }
+
+        for name in iOSGpuRuntimeDylibs {
+            let url = frameworkURL.appendingPathComponent(name)
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                log.warning("LiteRT GPU runtime dylib missing: \(name)")
+                continue
+            }
+
+            if dlopen(url.path, RTLD_NOW | RTLD_GLOBAL) == nil {
+                let message = dlerror().map { String(cString: $0) } ?? "unknown dlopen error"
+                log.warning("Failed to preload \(name): \(message)")
+            }
+        }
+        #endif
+    }
+
+    private static func cliteRTLMFrameworkURL() -> URL? {
+        #if canImport(Darwin)
+        for index in 0..<_dyld_image_count() {
+            guard let imageName = _dyld_get_image_name(index) else { continue }
+            let imagePath = String(cString: imageName)
+            guard imagePath.contains("/CLiteRTLM.framework/CLiteRTLM") else { continue }
+            return URL(fileURLWithPath: imagePath).deletingLastPathComponent()
+        }
+        #endif
+        return nil
     }
 
     /// Unload the model to free memory.
