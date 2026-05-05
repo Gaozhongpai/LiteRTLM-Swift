@@ -1063,6 +1063,32 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         )
     }
 
+    /// Tool-aware streaming counterpart of `conversationSendImage`.
+    ///
+    /// Uses the same persistent Conversation as text tool calling, but sends a
+    /// multimodal user message. This lets callers receive either natural text
+    /// or parsed tool-call batches from an image turn without leaving the
+    /// Conversation/KV-cache path.
+    public func conversationSendImageWithToolsStreaming(
+        imageData: Data,
+        prompt: String,
+        maxImageDimension: Int = 1024
+    ) throws -> AsyncThrowingStream<ConversationTurn, Error> {
+        try ensureReady()
+        try ensureModalityEnabled(.vision, name: "Vision")
+        let payload = try Self.prepareMultimodalPayload(
+            audioData: [],
+            audioFormat: .wav,
+            imagesData: [imageData],
+            prompt: prompt,
+            maxImageDimension: maxImageDimension
+        )
+        return streamPersistentConversationMessageWithTools(
+            messageJSON: payload.messageJSON,
+            tempURLs: payload.tempURLs
+        )
+    }
+
     /// Send one or more images through the persistent Conversation.
     ///
     /// The Conversation's KV cache holds all previous context (text, audio,
@@ -1932,11 +1958,14 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     /// Streaming variant that yields `ConversationTurn` events — text chunks
     /// and tool-call batches — on the persistent Conversation's KV cache.
     private func streamPersistentConversationMessageWithTools(
-        messageJSON: String
+        messageJSON: String,
+        tempURLs: [URL] = []
     ) -> AsyncThrowingStream<ConversationTurn, Error> {
         AsyncThrowingStream { continuation in
             self.inferenceQueue.async { [self] in
+                let urlsToCleanup = tempURLs
                 guard let conversation = self.chatConversation else {
+                    Self.cleanupTempFiles(urlsToCleanup)
                     continuation.finish(throwing: LiteRTLMError.inferenceFailure("No persistent conversation open — call openConversation() first"))
                     return
                 }
@@ -1989,11 +2018,13 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
                 if callResult != 0 {
                     Unmanaged<ToolStreamCallbackState>.fromOpaque(statePtr).release()
+                    Self.cleanupTempFiles(urlsToCleanup)
                     continuation.finish(throwing: LiteRTLMError.inferenceFailure("Failed to start conversation stream"))
                     return
                 }
 
                 streamDone.wait()
+                Self.cleanupTempFiles(urlsToCleanup)
                 self.logConversationBenchmark(conversation)
             }
         }
