@@ -35,6 +35,26 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
     // MARK: - Types
 
+    public struct EnabledModalities: OptionSet, Sendable {
+        public let rawValue: Int
+
+        public init(rawValue: Int) {
+            self.rawValue = rawValue
+        }
+
+        public static let vision = EnabledModalities(rawValue: 1 << 0)
+        public static let audio = EnabledModalities(rawValue: 1 << 1)
+        public static let all: EnabledModalities = [.vision, .audio]
+        public static let textOnly: EnabledModalities = []
+
+        fileprivate var logDescription: String {
+            var parts = ["text"]
+            if contains(.vision) { parts.append("vision") }
+            if contains(.audio) { parts.append("audio") }
+            return parts.joined(separator: "+")
+        }
+    }
+
     public enum Status: Sendable, Equatable {
         case notLoaded
         case loading
@@ -78,6 +98,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
     private let modelPath: URL
     private let backend: String
+    public let enabledModalities: EnabledModalities
 
     private var engine: OpaquePointer?  // LiteRtLmEngine*
     private var didWarmTextDecode = false
@@ -100,9 +121,17 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     ///   - backend: Main/text compute backend — `"cpu"` or `"gpu"` (GPU uses Metal on iOS).
     ///     The audio encoder remains on CPU because Gemma 4 E2B's audio section
     ///     is packaged with a CPU-only backend constraint.
-    public init(modelPath: URL, backend: String = "cpu") {
+    ///   - enabledModalities: Optional non-text executors to configure at load
+    ///     time. Use `.textOnly` for lower resident memory when the app already
+    ///     converts speech/images before calling the LLM.
+    public init(
+        modelPath: URL,
+        backend: String = "cpu",
+        enabledModalities: EnabledModalities = .all
+    ) {
         self.modelPath = modelPath
         self.backend = backend
+        self.enabledModalities = enabledModalities
     }
 
     deinit {
@@ -134,11 +163,12 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         guard status != .ready && status != .loading else { return }
 
         status = .loading
-        Self.log.info("Loading model: \(self.modelPath.lastPathComponent), backend: \(self.backend)")
+        Self.log.info("Loading model: \(self.modelPath.lastPathComponent), backend: \(self.backend), modalities: \(self.enabledModalities.logDescription)")
 
         let path = modelPath.path
         let backendStr = self.backend
-        let audioBackendStr = "cpu"
+        let visionBackendStr: String? = enabledModalities.contains(.vision) ? backendStr : nil
+        let audioBackendStr: String? = enabledModalities.contains(.audio) ? "cpu" : nil
         let startTime = CFAbsoluteTimeGetCurrent()
 
         guard FileManager.default.fileExists(atPath: path) else {
@@ -163,7 +193,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                         }
 
                         guard let settings = litert_lm_engine_settings_create(
-                            path, backendStr, backendStr, audioBackendStr
+                            path, backendStr, visionBackendStr, audioBackendStr
                         ) else {
                             throw LiteRTLMError.engineCreationFailed("Failed to create engine settings")
                         }
@@ -254,6 +284,12 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         }
         #endif
         return nil
+    }
+
+    private func ensureModalityEnabled(_ modality: EnabledModalities, name: String) throws {
+        guard enabledModalities.contains(modality) else {
+            throw LiteRTLMError.inferenceFailure("\(name) backend was not enabled when this engine was loaded")
+        }
     }
 
     /// Unload the model to free memory.
@@ -360,6 +396,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         maxImageDimension: Int = 1024
     ) async throws -> String {
         try ensureReady()
+        try ensureModalityEnabled(.vision, name: "Vision")
         let payload = try Self.prepareMultimodalPayload(
             audioData: [],
             audioFormat: .wav,
@@ -396,6 +433,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         maxImageDimension: Int = 1024
     ) async throws -> String {
         try ensureReady()
+        try ensureModalityEnabled(.vision, name: "Vision")
         guard !imagesData.isEmpty else {
             throw LiteRTLMError.inferenceFailure("No images provided")
         }
@@ -445,6 +483,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         topP: Float = 0.95
     ) async throws -> String {
         try ensureReady()
+        try ensureModalityEnabled(.audio, name: "Audio")
         guard !audioData.isEmpty else {
             throw LiteRTLMError.inferenceFailure("No audio data provided")
         }
@@ -490,6 +529,12 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         maxImageDimension: Int = 1024
     ) async throws -> String {
         try ensureReady()
+        if !audioData.isEmpty {
+            try ensureModalityEnabled(.audio, name: "Audio")
+        }
+        if !imagesData.isEmpty {
+            try ensureModalityEnabled(.vision, name: "Vision")
+        }
         guard !audioData.isEmpty || !imagesData.isEmpty else {
             throw LiteRTLMError.inferenceFailure("No audio or image data provided")
         }
@@ -934,6 +979,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         format: AudioFormat = .wav
     ) async throws -> String {
         try ensureReady()
+        try ensureModalityEnabled(.audio, name: "Audio")
         guard !audioData.isEmpty else {
             throw LiteRTLMError.inferenceFailure("No audio data provided")
         }
@@ -967,6 +1013,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         format: AudioFormat = .wav
     ) throws -> AsyncThrowingStream<String, Error> {
         try ensureReady()
+        try ensureModalityEnabled(.audio, name: "Audio")
         guard !audioData.isEmpty else {
             throw LiteRTLMError.inferenceFailure("No audio data provided")
         }
@@ -1008,6 +1055,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         maxImageDimension: Int = 1024
     ) throws -> AsyncThrowingStream<String, Error> {
         try ensureReady()
+        try ensureModalityEnabled(.vision, name: "Vision")
         return try conversationSendImagesStreaming(
             imagesData: [imageData],
             prompt: prompt,
@@ -1025,6 +1073,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         maxImageDimension: Int = 1024
     ) async throws -> String {
         try ensureReady()
+        try ensureModalityEnabled(.vision, name: "Vision")
         let payload = try Self.prepareMultimodalPayload(
             audioData: [],
             audioFormat: .wav,
@@ -1045,6 +1094,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         maxImageDimension: Int = 1024
     ) throws -> AsyncThrowingStream<String, Error> {
         try ensureReady()
+        try ensureModalityEnabled(.vision, name: "Vision")
         let payload = try Self.prepareMultimodalPayload(
             audioData: [],
             audioFormat: .wav,
@@ -1070,6 +1120,12 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         maxImageDimension: Int = 1024
     ) async throws -> String {
         try ensureReady()
+        if !audioData.isEmpty {
+            try ensureModalityEnabled(.audio, name: "Audio")
+        }
+        if !imagesData.isEmpty {
+            try ensureModalityEnabled(.vision, name: "Vision")
+        }
         let payload = try Self.prepareMultimodalPayload(
             audioData: audioData,
             audioFormat: audioFormat,
@@ -1195,6 +1251,16 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     /// - Returns: An `AsyncThrowingStream` yielding text chunks.
     public func sessionGenerateStreaming(inputs: [SessionInput]) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
+            if inputs.contains(where: {
+                switch $0 {
+                case .audio, .preprocessedAudio: return true
+                case .text: return false
+                }
+            }) && !self.enabledModalities.contains(.audio) {
+                continuation.finish(throwing: LiteRTLMError.inferenceFailure("Audio backend was not enabled when this engine was loaded"))
+                return
+            }
+
             self.inferenceQueue.async { [self] in
                 guard let session = self.chatSession else {
                     continuation.finish(throwing: LiteRTLMError.inferenceFailure("No persistent session open — call openSession() first"))
@@ -1323,6 +1389,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     /// `sessionGenerateStreaming(inputs:)`.
     public func sessionPreprocessAudio(_ audioData: Data) async throws -> SessionPreprocessedAudio {
         try ensureReady()
+        try ensureModalityEnabled(.audio, name: "Audio")
         guard !audioData.isEmpty else {
             throw LiteRTLMError.inferenceFailure("No audio data provided")
         }
