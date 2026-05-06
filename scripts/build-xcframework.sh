@@ -134,16 +134,21 @@ DEVICE_EXTRA_DYLIBS=()
 SIM_EXTRA_DYLIBS=()
 
 collect_extra_dylib() {
-    local -n OUT_ARRAY="$1"
+    local OUT_ARRAY_NAME="$1"
     local PLATFORM_DIR="$2"
     local NAME="$3"
+    local CANDIDATE=""
 
     if [ -f "$LITERT_LM_DIR/prebuilt/$PLATFORM_DIR/$NAME" ]; then
-        OUT_ARRAY+=("$LITERT_LM_DIR/prebuilt/$PLATFORM_DIR/$NAME")
+        CANDIDATE="$LITERT_LM_DIR/prebuilt/$PLATFORM_DIR/$NAME"
         info "Found $PLATFORM_DIR $NAME in prebuilt/$PLATFORM_DIR"
     elif [ -f "$LITERT_LM_DIR/bazel-bin/c/$NAME" ]; then
-        OUT_ARRAY+=("$LITERT_LM_DIR/bazel-bin/c/$NAME")
+        CANDIDATE="$LITERT_LM_DIR/bazel-bin/c/$NAME"
         info "Found $PLATFORM_DIR $NAME in bazel-bin/c"
+    fi
+
+    if [ -n "$CANDIDATE" ]; then
+        eval "$OUT_ARRAY_NAME+=(\"\$CANDIDATE\")"
     fi
 }
 
