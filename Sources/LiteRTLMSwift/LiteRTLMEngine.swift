@@ -9,8 +9,10 @@ import Darwin
 
 /// Swift wrapper for Google's LiteRT-LM on-device inference engine.
 ///
-/// Supports text generation (Session API) and multimodal inference — vision
-/// and audio — (Conversation API) with `.litertlm` model files (e.g. Gemma 4 E2B).
+/// MiloFlow's supported path is the Conversation API: stateful text,
+/// multimodal turns, tool calling, eager preface prefill, and runtime-probed
+/// conversation cloning. Older one-shot Session helpers remain available as
+/// compatibility utilities but are not the primary integration surface.
 ///
 /// Thread safety: all C API calls are serialized on an internal dispatch queue.
 /// The class is `@unchecked Sendable` because OpaquePointers are only accessed
@@ -21,14 +23,8 @@ import Darwin
 /// let engine = LiteRTLMEngine(modelPath: modelURL)
 /// try await engine.load()
 ///
-/// // Text
-/// let response = try await engine.generate(prompt: "Hello!", temperature: 0.7, maxTokens: 256)
-///
-/// // Vision
-/// let caption = try await engine.vision(imageData: jpegData, prompt: "Describe this photo.")
-///
-/// // Audio
-/// let transcript = try await engine.audio(audioData: wavData, prompt: "Transcribe this audio.")
+/// try await engine.openConversation(systemPrompt: "You are a helpful assistant.")
+/// let response = try await engine.conversationSendText("Hello!")
 /// ```
 @Observable
 public final class LiteRTLMEngine: @unchecked Sendable {
@@ -53,6 +49,21 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             if contains(.audio) { parts.append("audio") }
             return parts.joined(separator: "+")
         }
+    }
+
+    private struct ConversationOptions: Sendable, Equatable {
+        var extraContextJSON: String?
+        var visualTokenBudget: Int?
+
+        init(
+            extraContextJSON: String? = nil,
+            visualTokenBudget: Int? = nil
+        ) {
+            self.extraContextJSON = extraContextJSON
+            self.visualTokenBudget = visualTokenBudget
+        }
+
+        static let none = ConversationOptions()
     }
 
     public enum Status: Sendable, Equatable {
@@ -92,8 +103,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     public var isReady: Bool { status == .ready }
 
     /// Whether the loaded backend supports `litert_lm_conversation_clone`.
-    /// Probed once at load time. SessionBasic returns false; SessionAdvanced
-    /// (when the model + execution manager support it) returns true.
+    /// Probed once at load time. Current upstream exposes the C API and
+    /// supports it through SessionAdvanced; SessionBasic still returns false.
     public private(set) var supportsConversationClone: Bool = false
 
     /// Whether this engine load enabled LiteRT-LM speculative decoding.
@@ -102,6 +113,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     private let modelPath: URL
     private let backend: String
     private let speculativeDecodingPreference: Bool?
+    private let parallelFileSectionLoading: Bool
+    private let prefillChunkSize: Int?
     public let enabledModalities: EnabledModalities
 
     private var engine: OpaquePointer?  // LiteRtLmEngine*
@@ -134,12 +147,16 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         modelPath: URL,
         backend: String = "cpu",
         enableSpeculativeDecoding: Bool? = nil,
-        enabledModalities: EnabledModalities = .all
+        enabledModalities: EnabledModalities = .all,
+        parallelFileSectionLoading: Bool = true,
+        prefillChunkSize: Int? = nil
     ) {
         self.modelPath = modelPath
         self.backend = backend
         self.speculativeDecodingPreference = enableSpeculativeDecoding
         self.enabledModalities = enabledModalities
+        self.parallelFileSectionLoading = parallelFileSectionLoading
+        self.prefillChunkSize = prefillChunkSize
     }
 
     deinit {
@@ -218,6 +235,11 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                         }
 
                         litert_lm_engine_settings_set_max_num_tokens(settings, 4096)
+                        litert_lm_engine_settings_set_parallel_file_section_loading(settings, self.parallelFileSectionLoading)
+
+                        if let prefillChunkSize = self.prefillChunkSize, prefillChunkSize > 0 {
+                            litert_lm_engine_settings_set_prefill_chunk_size(settings, Int32(prefillChunkSize))
+                        }
 
                         if enableSpeculativeDecoding {
                             litert_lm_engine_settings_set_enable_speculative_decoding(settings, true)
@@ -447,7 +469,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         maxTokens: Int = 512,
         topK: Int = 40,
         topP: Float = 0.95,
-        maxImageDimension: Int = 1024
+        maxImageDimension: Int = 1024,
+        visualTokenBudget: Int? = nil
     ) async throws -> String {
         try ensureReady()
         try ensureModalityEnabled(.vision, name: "Vision")
@@ -464,7 +487,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             temperature: temperature,
             maxTokens: maxTokens,
             topK: topK,
-            topP: topP
+            topP: topP,
+            conversationOptions: ConversationOptions(visualTokenBudget: visualTokenBudget)
         )
     }
 
@@ -484,7 +508,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         maxTokens: Int = 1024,
         topK: Int = 40,
         topP: Float = 0.95,
-        maxImageDimension: Int = 1024
+        maxImageDimension: Int = 1024,
+        visualTokenBudget: Int? = nil
     ) async throws -> String {
         try ensureReady()
         try ensureModalityEnabled(.vision, name: "Vision")
@@ -504,7 +529,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             temperature: temperature,
             maxTokens: maxTokens,
             topK: topK,
-            topP: topP
+            topP: topP,
+            conversationOptions: ConversationOptions(visualTokenBudget: visualTokenBudget)
         )
     }
 
@@ -580,7 +606,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         maxTokens: Int = 1024,
         topK: Int = 40,
         topP: Float = 0.95,
-        maxImageDimension: Int = 1024
+        maxImageDimension: Int = 1024,
+        visualTokenBudget: Int? = nil
     ) async throws -> String {
         try ensureReady()
         if !audioData.isEmpty {
@@ -605,7 +632,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             temperature: temperature,
             maxTokens: maxTokens,
             topK: topK,
-            topP: topP
+            topP: topP,
+            conversationOptions: ConversationOptions(visualTokenBudget: visualTokenBudget)
         )
     }
 
@@ -706,6 +734,14 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         }
     }
 
+    /// Request cancellation of the currently-running persistent Session work.
+    public func cancelActiveSessionProcess() {
+        inferenceQueue.async { [self] in
+            guard let session = chatSession else { return }
+            litert_lm_session_cancel_process(session)
+        }
+    }
+
     // MARK: - Persistent Conversation (Multi-turn Multimodal)
 
     /// Open a persistent Conversation for multi-turn text and multimodal turns.
@@ -721,7 +757,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         temperature: Float = 0.3,
         maxTokens: Int = 512,
         topK: Int = 40,
-        topP: Float = 0.95
+        topP: Float = 0.95,
+        filterChannelContentFromKVCache: Bool = false
     ) async throws {
         try ensureReady()
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
@@ -757,7 +794,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                         sessionConfig: sessionConfig,
                         systemPrompt: systemPrompt,
                         toolsJSON: toolsJSON,
-                        historyJSON: historyJSON
+                        historyJSON: historyJSON,
+                        filterChannelContentFromKVCache: filterChannelContentFromKVCache
                     ) else {
                         litert_lm_session_config_delete(sessionConfig)
                         throw LiteRTLMError.inferenceFailure("Failed to create persistent conversation config")
@@ -817,6 +855,14 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                 }
                 continuation.resume()
             }
+        }
+    }
+
+    /// Request cancellation of the currently-running persistent Conversation work.
+    public func cancelActiveConversationProcess() {
+        inferenceQueue.async { [self] in
+            guard let conversation = chatConversation else { return }
+            litert_lm_conversation_cancel_process(conversation)
         }
     }
 
@@ -1093,12 +1139,14 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     public func conversationSendImage(
         imageData: Data,
         prompt: String,
-        maxImageDimension: Int = 1024
+        maxImageDimension: Int = 1024,
+        visualTokenBudget: Int? = nil
     ) async throws -> String {
         try await conversationSendImages(
             imagesData: [imageData],
             prompt: prompt,
-            maxImageDimension: maxImageDimension
+            maxImageDimension: maxImageDimension,
+            visualTokenBudget: visualTokenBudget
         )
     }
 
@@ -1106,14 +1154,16 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     public func conversationSendImageStreaming(
         imageData: Data,
         prompt: String,
-        maxImageDimension: Int = 1024
+        maxImageDimension: Int = 1024,
+        visualTokenBudget: Int? = nil
     ) throws -> AsyncThrowingStream<String, Error> {
         try ensureReady()
         try ensureModalityEnabled(.vision, name: "Vision")
         return try conversationSendImagesStreaming(
             imagesData: [imageData],
             prompt: prompt,
-            maxImageDimension: maxImageDimension
+            maxImageDimension: maxImageDimension,
+            visualTokenBudget: visualTokenBudget
         )
     }
 
@@ -1126,7 +1176,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     public func conversationSendImageWithToolsStreaming(
         imageData: Data,
         prompt: String,
-        maxImageDimension: Int = 1024
+        maxImageDimension: Int = 1024,
+        visualTokenBudget: Int? = nil
     ) throws -> AsyncThrowingStream<ConversationTurn, Error> {
         try ensureReady()
         try ensureModalityEnabled(.vision, name: "Vision")
@@ -1139,7 +1190,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         )
         return streamPersistentConversationMessageWithTools(
             messageJSON: payload.messageJSON,
-            tempURLs: payload.tempURLs
+            tempURLs: payload.tempURLs,
+            conversationOptions: ConversationOptions(visualTokenBudget: visualTokenBudget)
         )
     }
 
@@ -1150,7 +1202,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     public func conversationSendImages(
         imagesData: [Data],
         prompt: String,
-        maxImageDimension: Int = 1024
+        maxImageDimension: Int = 1024,
+        visualTokenBudget: Int? = nil
     ) async throws -> String {
         try ensureReady()
         try ensureModalityEnabled(.vision, name: "Vision")
@@ -1163,7 +1216,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         )
         return try await sendPersistentConversationMessage(
             messageJSON: payload.messageJSON,
-            tempURLs: payload.tempURLs
+            tempURLs: payload.tempURLs,
+            conversationOptions: ConversationOptions(visualTokenBudget: visualTokenBudget)
         )
     }
 
@@ -1171,7 +1225,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     public func conversationSendImagesStreaming(
         imagesData: [Data],
         prompt: String,
-        maxImageDimension: Int = 1024
+        maxImageDimension: Int = 1024,
+        visualTokenBudget: Int? = nil
     ) throws -> AsyncThrowingStream<String, Error> {
         try ensureReady()
         try ensureModalityEnabled(.vision, name: "Vision")
@@ -1184,7 +1239,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         )
         return streamPersistentConversationMessage(
             messageJSON: payload.messageJSON,
-            tempURLs: payload.tempURLs
+            tempURLs: payload.tempURLs,
+            conversationOptions: ConversationOptions(visualTokenBudget: visualTokenBudget)
         )
     }
 
@@ -1197,7 +1253,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         audioFormat: AudioFormat = .wav,
         imagesData: [Data] = [],
         prompt: String,
-        maxImageDimension: Int = 1024
+        maxImageDimension: Int = 1024,
+        visualTokenBudget: Int? = nil
     ) async throws -> String {
         try ensureReady()
         if !audioData.isEmpty {
@@ -1215,7 +1272,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         )
         return try await sendPersistentConversationMessage(
             messageJSON: payload.messageJSON,
-            tempURLs: payload.tempURLs
+            tempURLs: payload.tempURLs,
+            conversationOptions: ConversationOptions(visualTokenBudget: visualTokenBudget)
         )
     }
 
@@ -1225,7 +1283,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         audioFormat: AudioFormat = .wav,
         imagesData: [Data] = [],
         prompt: String,
-        maxImageDimension: Int = 1024
+        maxImageDimension: Int = 1024,
+        visualTokenBudget: Int? = nil
     ) throws -> AsyncThrowingStream<String, Error> {
         try ensureReady()
         let payload = try Self.prepareMultimodalPayload(
@@ -1237,8 +1296,63 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         )
         return streamPersistentConversationMessage(
             messageJSON: payload.messageJSON,
-            tempURLs: payload.tempURLs
+            tempURLs: payload.tempURLs,
+            conversationOptions: ConversationOptions(visualTokenBudget: visualTokenBudget)
         )
+    }
+
+    /// Tokenize text using the loaded engine tokenizer.
+    public func tokenize(_ text: String) async throws -> [Int32] {
+        try ensureReady()
+        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[Int32], Error>) in
+            inferenceQueue.async { [self] in
+                do {
+                    guard let engine else { throw LiteRTLMError.modelNotLoaded }
+                    guard let result = text.withCString({ litert_lm_engine_tokenize(engine, $0) }) else {
+                        throw LiteRTLMError.inferenceFailure("Tokenization returned no result")
+                    }
+                    defer { litert_lm_tokenize_result_delete(result) }
+
+                    let count = litert_lm_tokenize_result_get_num_tokens(result)
+                    guard count > 0 else {
+                        continuation.resume(returning: [])
+                        return
+                    }
+                    guard let tokens = litert_lm_tokenize_result_get_tokens(result) else {
+                        throw LiteRTLMError.inferenceFailure("Tokenization returned a null token buffer")
+                    }
+                    continuation.resume(returning: Array(UnsafeBufferPointer(start: tokens, count: count)))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// Detokenize token ids using the loaded engine tokenizer.
+    public func detokenize(_ tokens: [Int32]) async throws -> String {
+        try ensureReady()
+        guard !tokens.isEmpty else { return "" }
+        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
+            inferenceQueue.async { [self] in
+                do {
+                    guard let engine else { throw LiteRTLMError.modelNotLoaded }
+                    guard let result = tokens.withUnsafeBufferPointer({
+                        litert_lm_engine_detokenize(engine, $0.baseAddress, $0.count)
+                    }) else {
+                        throw LiteRTLMError.inferenceFailure("Detokenization returned no result")
+                    }
+                    defer { litert_lm_detokenize_result_delete(result) }
+
+                    guard let string = litert_lm_detokenize_result_get_string(result) else {
+                        throw LiteRTLMError.inferenceFailure("Detokenization returned a null string")
+                    }
+                    continuation.resume(returning: String(cString: string))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
     }
 
     /// Stream text using the persistent session.
@@ -1756,7 +1870,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         sessionConfig: OpaquePointer,
         systemPrompt: String?,
         toolsJSON: String?,
-        historyJSON: String?
+        historyJSON: String?,
+        filterChannelContentFromKVCache: Bool = false
     ) -> OpaquePointer? {
         let systemContent = systemPrompt?.trimmingCharacters(in: .whitespacesAndNewlines)
         let toolsContent = toolsJSON?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1767,6 +1882,10 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         }
         litert_lm_conversation_config_set_session_config(config, sessionConfig)
         litert_lm_conversation_config_set_enable_constrained_decoding(config, toolsContent != nil)
+        litert_lm_conversation_config_set_filter_channel_content_from_kv_cache(
+            config,
+            filterChannelContentFromKVCache
+        )
         // Eagerly prefill system prompt + tools + history into the KV cache at
         // conversation-create time. Without this, prewarmProjectChat only
         // allocates structures; the model forward pass over the preface is
@@ -1817,7 +1936,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             sessionConfig: sessionConfig,
             systemPrompt: systemPrompt,
             toolsJSON: toolsJSON,
-            historyJSON: historyJSON
+            historyJSON: historyJSON,
+            filterChannelContentFromKVCache: !tools.isEmpty
         ) else {
             throw LiteRTLMError.inferenceFailure("Failed to create conversation config")
         }
@@ -1839,9 +1959,9 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     }
 
     /// Probes whether the active engine backend implements `Session::Clone`.
-    /// SessionBasic does not override Clone, so the call returns null.
-    /// SessionAdvanced returns a real cloned conversation. Runs synchronously
-    /// on the inference queue; safe to call once at load time.
+    /// Upstream's C API is present, but support is still backend-dependent:
+    /// SessionAdvanced returns a real cloned conversation, while SessionBasic
+    /// still falls back to `UnimplementedError`.
     private static func probeConversationCloneSupport(engine eng: OpaquePointer) -> Bool {
         guard let sessionConfig = litert_lm_session_config_create() else { return false }
         defer { litert_lm_session_config_delete(sessionConfig) }
@@ -1865,12 +1985,43 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
     private nonisolated static func withOptionalCString<T>(
         _ value: String?,
-        _ body: (UnsafePointer<CChar>?) -> T
-    ) -> T {
+        _ body: (UnsafePointer<CChar>?) throws -> T
+    ) rethrows -> T {
         if let value {
-            return value.withCString { body($0) }
+            return try value.withCString { try body($0) }
         }
-        return body(nil)
+        return try body(nil)
+    }
+
+    private nonisolated static func withConversationOptions<T>(
+        _ options: ConversationOptions,
+        _ body: (UnsafePointer<CChar>?, OpaquePointer?) throws -> T
+    ) rethrows -> T {
+        let extraContext = options.extraContextJSON?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanExtraContext = (extraContext?.isEmpty == false) ? extraContext : nil
+
+        let optionalArgs: OpaquePointer?
+        if let visualTokenBudget = options.visualTokenBudget, visualTokenBudget > 0 {
+            optionalArgs = litert_lm_conversation_optional_args_create()
+            if let optionalArgs {
+                litert_lm_conversation_optional_args_set_visual_token_budget(
+                    optionalArgs,
+                    Int32(visualTokenBudget)
+                )
+            }
+        } else {
+            optionalArgs = nil
+        }
+        defer {
+            if let optionalArgs {
+                litert_lm_conversation_optional_args_delete(optionalArgs)
+            }
+        }
+
+        return try withOptionalCString(cleanExtraContext) { extraContextPtr in
+            try body(extraContextPtr, optionalArgs)
+        }
     }
 
     private func extractResponseText(_ responses: OpaquePointer) -> String? {
@@ -1900,7 +2051,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         temperature: Float,
         maxTokens: Int,
         topK: Int,
-        topP: Float
+        topP: Float,
+        conversationOptions: ConversationOptions = .none
     ) async throws -> String {
         let urlsToCleanup = tempURLs
         return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, any Error>) in
@@ -1941,8 +2093,10 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                         litert_lm_session_config_delete(sessionConfig)
                     }
 
-                    guard let response = messageJSON.withCString({ msgPtr in
-                        litert_lm_conversation_send_message(conversation, msgPtr, nil)
+                    guard let response = try Self.withConversationOptions(conversationOptions, { extraContextPtr, optionalArgs in
+                        messageJSON.withCString { msgPtr in
+                            litert_lm_conversation_send_message(conversation, msgPtr, extraContextPtr, optionalArgs)
+                        }
                     }) else {
                         throw LiteRTLMError.inferenceFailure("Conversation returned no response")
                     }
@@ -1963,11 +2117,13 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
     private func sendPersistentConversationMessage(
         messageJSON: String,
-        tempURLs: [URL] = []
+        tempURLs: [URL] = [],
+        conversationOptions: ConversationOptions = .none
     ) async throws -> String {
         let raw = try await sendPersistentConversationMessageRaw(
             messageJSON: messageJSON,
-            tempURLs: tempURLs
+            tempURLs: tempURLs,
+            conversationOptions: conversationOptions
         )
         return Self.extractTextFromConversationResponse(raw)
     }
@@ -1977,7 +2133,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     /// `tool_calls` use this path and parse themselves.
     private func sendPersistentConversationMessageRaw(
         messageJSON: String,
-        tempURLs: [URL] = []
+        tempURLs: [URL] = [],
+        conversationOptions: ConversationOptions = .none
     ) async throws -> String {
         let urlsToCleanup = tempURLs
         return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, any Error>) in
@@ -1988,8 +2145,10 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                         throw LiteRTLMError.inferenceFailure("No persistent conversation open — call openConversation() first")
                     }
 
-                    guard let response = messageJSON.withCString({ msgPtr in
-                        litert_lm_conversation_send_message(conversation, msgPtr, nil)
+                    guard let response = try Self.withConversationOptions(conversationOptions, { extraContextPtr, optionalArgs in
+                        messageJSON.withCString { msgPtr in
+                            litert_lm_conversation_send_message(conversation, msgPtr, extraContextPtr, optionalArgs)
+                        }
                     }) else {
                         throw LiteRTLMError.inferenceFailure("Persistent conversation returned no response")
                     }
@@ -2013,9 +2172,10 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     /// and tool-call batches — on the persistent Conversation's KV cache.
     private func streamPersistentConversationMessageWithTools(
         messageJSON: String,
-        tempURLs: [URL] = []
+        tempURLs: [URL] = [],
+        conversationOptions: ConversationOptions = .none
     ) -> AsyncThrowingStream<ConversationTurn, Error> {
-        AsyncThrowingStream { continuation in
+        AsyncThrowingStream<ConversationTurn, Error> { (continuation: AsyncThrowingStream<ConversationTurn, Error>.Continuation) in
             self.inferenceQueue.async { [self] in
                 let urlsToCleanup = tempURLs
                 guard let conversation = self.chatConversation else {
@@ -2028,10 +2188,13 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                 let state = ToolStreamCallbackState(continuation: continuation, doneSemaphore: streamDone)
                 let statePtr = Unmanaged.passRetained(state).toOpaque()
 
-                let callResult = messageJSON.withCString { msgPtr -> Int32 in
-                    litert_lm_conversation_send_message_stream(
-                        conversation, msgPtr, nil,
-                        { callbackData, chunk, isFinal, errorMsg in
+                let callResult: Int32
+                do {
+                    callResult = try Self.withConversationOptions(conversationOptions) { extraContextPtr, optionalArgs in
+                        messageJSON.withCString { msgPtr -> Int32 in
+                            litert_lm_conversation_send_message_stream(
+                                conversation, msgPtr, extraContextPtr, optionalArgs,
+                                { callbackData, chunk, isFinal, errorMsg in
                             guard let cbData = callbackData else { return }
                             let st = Unmanaged<ToolStreamCallbackState>.fromOpaque(cbData)
                                 .takeUnretainedValue()
@@ -2065,9 +2228,16 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                                 Unmanaged<ToolStreamCallbackState>.fromOpaque(cbData).release()
                                 semaphore.signal()
                             }
-                        },
-                        statePtr
-                    )
+                                },
+                                statePtr
+                            )
+                        }
+                    }
+                } catch {
+                    Unmanaged<ToolStreamCallbackState>.fromOpaque(statePtr).release()
+                    Self.cleanupTempFiles(urlsToCleanup)
+                    continuation.finish(throwing: error)
+                    return
                 }
 
                 if callResult != 0 {
@@ -2090,9 +2260,10 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     /// incrementally instead of blocking for the full response.
     private func streamPersistentConversationMessage(
         messageJSON: String,
-        tempURLs: [URL] = []
+        tempURLs: [URL] = [],
+        conversationOptions: ConversationOptions = .none
     ) -> AsyncThrowingStream<String, Error> {
-        AsyncThrowingStream { continuation in
+        AsyncThrowingStream<String, Error> { (continuation: AsyncThrowingStream<String, Error>.Continuation) in
             self.inferenceQueue.async { [self] in
                 let urlsToCleanup = tempURLs
                 guard let conversation = self.chatConversation else {
@@ -2105,10 +2276,13 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                 let state = StreamCallbackState(continuation: continuation, doneSemaphore: streamDone)
                 let statePtr = Unmanaged.passRetained(state).toOpaque()
 
-                let callResult = messageJSON.withCString { msgPtr -> Int32 in
-                    litert_lm_conversation_send_message_stream(
-                        conversation, msgPtr, nil,
-                        { callbackData, chunk, isFinal, errorMsg in
+                let callResult: Int32
+                do {
+                    callResult = try Self.withConversationOptions(conversationOptions) { extraContextPtr, optionalArgs in
+                        messageJSON.withCString { msgPtr -> Int32 in
+                            litert_lm_conversation_send_message_stream(
+                                conversation, msgPtr, extraContextPtr, optionalArgs,
+                                { callbackData, chunk, isFinal, errorMsg in
                             guard let cbData = callbackData else { return }
                             let st = Unmanaged<StreamCallbackState>.fromOpaque(cbData)
                                 .takeUnretainedValue()
@@ -2135,9 +2309,16 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                                 Unmanaged<StreamCallbackState>.fromOpaque(cbData).release()
                                 semaphore.signal()
                             }
-                        },
-                        statePtr
-                    )
+                                },
+                                statePtr
+                            )
+                        }
+                    }
+                } catch {
+                    Unmanaged<StreamCallbackState>.fromOpaque(statePtr).release()
+                    Self.cleanupTempFiles(urlsToCleanup)
+                    continuation.finish(throwing: error)
+                    return
                 }
 
                 if callResult != 0 {

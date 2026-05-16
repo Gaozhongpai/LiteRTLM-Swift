@@ -18,6 +18,28 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 OUTPUT_DIR="$PROJECT_DIR/Frameworks/LiteRTLM.xcframework"
 WORK_DIR="$(mktemp -d)"
+LITERT_BUILD_FILE=""
+LITERT_BUILD_BACKUP=""
+LITERT_ENGINE_CC=""
+LITERT_ENGINE_CC_BACKUP=""
+LITERT_ENGINE_H=""
+LITERT_ENGINE_H_BACKUP=""
+
+cleanup() {
+    local status=$?
+    if [ -n "${LITERT_BUILD_FILE:-}" ] && [ -n "${LITERT_BUILD_BACKUP:-}" ] && [ -f "$LITERT_BUILD_BACKUP" ]; then
+        cp "$LITERT_BUILD_BACKUP" "$LITERT_BUILD_FILE"
+    fi
+    if [ -n "${LITERT_ENGINE_CC:-}" ] && [ -n "${LITERT_ENGINE_CC_BACKUP:-}" ] && [ -f "$LITERT_ENGINE_CC_BACKUP" ]; then
+        cp "$LITERT_ENGINE_CC_BACKUP" "$LITERT_ENGINE_CC"
+    fi
+    if [ -n "${LITERT_ENGINE_H:-}" ] && [ -n "${LITERT_ENGINE_H_BACKUP:-}" ] && [ -f "$LITERT_ENGINE_H_BACKUP" ]; then
+        cp "$LITERT_ENGINE_H_BACKUP" "$LITERT_ENGINE_H"
+    fi
+    rm -rf "$WORK_DIR"
+    exit "$status"
+}
+trap cleanup EXIT
 
 # Colors
 RED='\033[0;31m'
@@ -46,8 +68,48 @@ if [ ! -f "$LITERT_LM_DIR/c/BUILD" ]; then
 fi
 
 LITERT_LM_DIR="$(cd "$LITERT_LM_DIR" && pwd)"
+LITERT_BUILD_FILE="$LITERT_LM_DIR/c/BUILD"
+LITERT_ENGINE_CC="$LITERT_LM_DIR/c/engine.cc"
+LITERT_ENGINE_H="$LITERT_LM_DIR/c/engine.h"
 
 info "Using LiteRT-LM source at: $LITERT_LM_DIR"
+
+# Official LiteRT-LM exposes the C library target but not an iOS shared-library
+# target with the framework binary name this Swift package ships. Add that
+# Bazel target temporarily for packaging only, then restore c/BUILD on exit.
+if ! grep -q 'name = "libLiteRTLMEngine.dylib"' "$LITERT_BUILD_FILE"; then
+    warn "Injecting temporary //c:libLiteRTLMEngine.dylib build target"
+    LITERT_BUILD_BACKUP="$WORK_DIR/c_BUILD.orig"
+    cp "$LITERT_BUILD_FILE" "$LITERT_BUILD_BACKUP"
+    cat >> "$LITERT_BUILD_FILE" << 'BAZEL_TARGET'
+
+# Added temporarily by LiteRTLM-Swift/scripts/build-xcframework.sh.
+cc_binary(
+    name = "libLiteRTLMEngine.dylib",
+    linkshared = True,
+    deps = [
+        ":engine",
+    ],
+)
+BAZEL_TARGET
+fi
+
+# Official upstream has the C++ ConversationConfig flag for eager preface
+# prefill, but not the C setter needed by Swift. Inject a tiny temporary C API
+# shim during packaging, then restore c/engine.{cc,h} on exit so the upstream
+# checkout stays clean.
+if ! grep -q 'litert_lm_conversation_config_set_prefill_preface_on_init' "$LITERT_ENGINE_H"; then
+    warn "Injecting temporary prefill_preface_on_init C API shim"
+    LITERT_ENGINE_CC_BACKUP="$WORK_DIR/c_engine.cc.orig"
+    LITERT_ENGINE_H_BACKUP="$WORK_DIR/c_engine.h.orig"
+    cp "$LITERT_ENGINE_CC" "$LITERT_ENGINE_CC_BACKUP"
+    cp "$LITERT_ENGINE_H" "$LITERT_ENGINE_H_BACKUP"
+
+    perl -0pi -e 's/(  bool filter_channel_content_from_kv_cache = false;\n)/$1  bool prefill_preface_on_init = false;\n/' "$LITERT_ENGINE_CC"
+    perl -0pi -e 's/(void litert_lm_conversation_config_set_filter_channel_content_from_kv_cache\(\n    LiteRtLmConversationConfig\* config,\n    bool filter_channel_content_from_kv_cache\) \{\n  if \(config\) \{\n    config->filter_channel_content_from_kv_cache =\n        filter_channel_content_from_kv_cache;\n  \}\n\}\n)/$1\nvoid litert_lm_conversation_config_set_prefill_preface_on_init(\n    LiteRtLmConversationConfig* config, bool prefill_preface_on_init) {\n  if (config) {\n    config->prefill_preface_on_init = prefill_preface_on_init;\n  }\n}\n/' "$LITERT_ENGINE_CC"
+    perl -0pi -e 's/(    builder\.SetFilterChannelContentFromKvCache\(\n        c_config->filter_channel_content_from_kv_cache\);\n)/$1    builder.SetPrefillPrefaceOnInit(c_config->prefill_preface_on_init);\n/' "$LITERT_ENGINE_CC"
+    perl -0pi -e 's/(void litert_lm_conversation_config_set_filter_channel_content_from_kv_cache\(\n    LiteRtLmConversationConfig\* config,\n    bool filter_channel_content_from_kv_cache\);\n)/$1\n\/\/ Sets whether the conversation should prefill the preface \(system message,\n\/\/ tools, and history\) into the KV cache during conversation creation. When\n\/\/ true, the prefill cost is paid up front by litert_lm_conversation_create;\n\/\/ the first user turn then only prefills the new turn. When false \(default\),\n\/\/ the entire context is prefilled on the first turn.\n\/\/ @param config The config to modify.\n\/\/ @param prefill_preface_on_init Whether to prefill the preface at init.\nLITERT_LM_C_API_EXPORT\nvoid litert_lm_conversation_config_set_prefill_preface_on_init(\n    LiteRtLmConversationConfig* config, bool prefill_preface_on_init);\n/' "$LITERT_ENGINE_H"
+fi
 
 # ---------------------------------------------------------------------------
 # 2. Check prerequisites
@@ -281,9 +343,4 @@ done
 TOTAL_SIZE=$(du -sh "$OUTPUT_DIR" | cut -f1)
 info "Total xcframework size: $TOTAL_SIZE"
 
-# ---------------------------------------------------------------------------
-# Cleanup
-# ---------------------------------------------------------------------------
-
-rm -rf "$WORK_DIR"
 info "Done! xcframework is ready at Frameworks/LiteRTLM.xcframework"

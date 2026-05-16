@@ -55,6 +55,10 @@ typedef struct LiteRtLmBenchmarkInfo LiteRtLmBenchmarkInfo;
 // Opaque pointer for the LiteRT LM Conversation.
 typedef struct LiteRtLmConversation LiteRtLmConversation;
 
+// Opaque pointer for the LiteRT LM Conversation Optional Args.
+typedef struct LiteRtLmConversationOptionalArgs
+    LiteRtLmConversationOptionalArgs;
+
 // Opaque pointer for a JSON response.
 typedef struct LiteRtLmJsonResponse LiteRtLmJsonResponse;
 
@@ -209,8 +213,8 @@ void litert_lm_conversation_config_set_filter_channel_content_from_kv_cache(
 // true, the prefill cost is paid up front by litert_lm_conversation_create;
 // the first user turn then only prefills the new turn. When false (default),
 // the entire context is prefilled on the first turn.
-// @param config The config to modify.
-// @param prefill_preface_on_init Whether to prefill the preface at init.
+//  config The config to modify.
+//  prefill_preface_on_init Whether to prefill the preface at init.
 LITERT_LM_C_API_EXPORT
 void litert_lm_conversation_config_set_prefill_preface_on_init(
     LiteRtLmConversationConfig* config, bool prefill_preface_on_init);
@@ -219,6 +223,26 @@ void litert_lm_conversation_config_set_prefill_preface_on_init(
 // @param config The config to destroy.
 LITERT_LM_C_API_EXPORT
 void litert_lm_conversation_config_delete(LiteRtLmConversationConfig* config);
+
+// Creates a LiteRT LM Conversation Optional Args. The caller is responsible
+// for destroying the optional args using
+// `litert_lm_conversation_optional_args_delete`.
+// @return A pointer to the created optional args, or NULL on failure.
+LITERT_LM_C_API_EXPORT
+LiteRtLmConversationOptionalArgs* litert_lm_conversation_optional_args_create();
+
+// Destroys a LiteRT LM Conversation Optional Args.
+// @param optional_args The optional args to destroy.
+LITERT_LM_C_API_EXPORT
+void litert_lm_conversation_optional_args_delete(
+    LiteRtLmConversationOptionalArgs* optional_args);
+
+// Sets the visual token budget for the conversation optional args.
+// @param optional_args The optional args to modify.
+// @param visual_token_budget The visual token budget.
+LITERT_LM_C_API_EXPORT
+void litert_lm_conversation_optional_args_set_visual_token_budget(
+    LiteRtLmConversationOptionalArgs* optional_args, int visual_token_budget);
 
 // Sets the minimum log level for the LiteRT LM library.
 // Log levels are: 0=VERBOSE, 1=DEBUG, 2=INFO, 3=WARNING, 4=ERROR, 5=FATAL,
@@ -282,6 +306,16 @@ LITERT_LM_C_API_EXPORT
 void litert_lm_engine_settings_set_parallel_file_section_loading(
     LiteRtLmEngineSettings* settings, bool parallel_file_section_loading);
 
+// Sets the maximum number of images for the engine.
+//
+// This is only used for the legacy implementation of the engine.
+//
+// @param settings The engine settings.
+// @param max_num_images The maximum number of images.
+LITERT_LM_C_API_EXPORT
+void litert_lm_engine_settings_set_max_num_images(
+    LiteRtLmEngineSettings* settings, int max_num_images);
+
 // Sets the cache directory for the engine.
 //
 // @param settings The engine settings.
@@ -289,6 +323,14 @@ void litert_lm_engine_settings_set_parallel_file_section_loading(
 LITERT_LM_C_API_EXPORT
 void litert_lm_engine_settings_set_cache_dir(LiteRtLmEngineSettings* settings,
                                              const char* cache_dir);
+
+// Sets the LiteRT dispatch library directory for NPU backend.
+//
+// @param settings The engine settings.
+// @param lib_dir The dispatch library directory.
+LITERT_LM_C_API_EXPORT
+void litert_lm_engine_settings_set_litert_dispatch_lib_dir(
+    LiteRtLmEngineSettings* settings, const char* lib_dir);
 
 // Sets the activation data type.
 //
@@ -364,16 +406,6 @@ void litert_lm_engine_delete(LiteRtLmEngine* engine);
 LITERT_LM_C_API_EXPORT
 LiteRtLmSession* litert_lm_engine_create_session(LiteRtLmEngine* engine,
                                                  LiteRtLmSessionConfig* config);
-
-// Clones a LiteRT LM Session using the runtime's native session clone support.
-// The cloned session keeps the settings and context of the source session up to
-// the point where this function is called. The caller is responsible for
-// destroying the returned session using `litert_lm_session_delete`.
-//
-// @param session The source session to clone.
-// @return A pointer to the cloned session, or NULL on failure.
-LITERT_LM_C_API_EXPORT
-LiteRtLmSession* litert_lm_session_clone(LiteRtLmSession* session);
 
 // Destroys a LiteRT LM Session.
 //
@@ -676,23 +708,21 @@ LITERT_LM_C_API_EXPORT
 LiteRtLmConversation* litert_lm_conversation_create(
     LiteRtLmEngine* engine, LiteRtLmConversationConfig* config);
 
-// Clones a LiteRT LM Conversation using the runtime's native conversation clone
-// support. The cloned conversation keeps the source conversation's settings,
-// history, and KV/context state up to the point where this function is called.
-// The caller is responsible for destroying the returned conversation using
-// `litert_lm_conversation_delete`.
-//
-// @param conversation The source conversation to clone.
-// @return A pointer to the cloned conversation, or NULL on failure.
-LITERT_LM_C_API_EXPORT
-LiteRtLmConversation* litert_lm_conversation_clone(
-    LiteRtLmConversation* conversation);
-
 // Destroys a LiteRT LM Conversation.
 //
 // @param conversation The conversation to destroy.
 LITERT_LM_C_API_EXPORT
 void litert_lm_conversation_delete(LiteRtLmConversation* conversation);
+
+// Clones a LiteRT LM Conversation, duplicating its prefilled state.
+// The caller is responsible for destroying the cloned conversation using
+// `litert_lm_conversation_delete`.
+//
+// @param conversation The conversation to clone.
+// @return A pointer to the cloned conversation, or NULL on failure.
+LITERT_LM_C_API_EXPORT
+LiteRtLmConversation* litert_lm_conversation_clone(
+    LiteRtLmConversation* conversation);
 
 // Sends a message to the conversation and returns the response.
 // This is a blocking call.
@@ -700,13 +730,15 @@ void litert_lm_conversation_delete(LiteRtLmConversation* conversation);
 // @param conversation The conversation to use.
 // @param message_json A JSON string representing the message to send.
 // @param extra_context A JSON string representing the extra context to use.
+// @param optional_args A pointer to the optional arguments to use.
 // @return A pointer to the JSON response, or NULL on failure. The caller is
 //   responsible for deleting the response using
 //   `litert_lm_json_response_delete`.
 LITERT_LM_C_API_EXPORT
 LiteRtLmJsonResponse* litert_lm_conversation_send_message(
     LiteRtLmConversation* conversation, const char* message_json,
-    const char* extra_context);
+    const char* extra_context,
+    const LiteRtLmConversationOptionalArgs* optional_args);
 
 // Destroys a LiteRT LM Json Response object.
 //
@@ -731,6 +763,7 @@ const char* litert_lm_json_response_get_string(
 // @param conversation The conversation to use.
 // @param message_json A JSON string representing the message to send.
 // @param extra_context A JSON string representing the extra context to use.
+// @param optional_args A pointer to the optional arguments to use.
 // @param callback The callback function to receive response chunks.
 // @param callback_data A pointer to user data that will be passed to the
 // callback.
@@ -738,8 +771,9 @@ const char* litert_lm_json_response_get_string(
 LITERT_LM_C_API_EXPORT
 int litert_lm_conversation_send_message_stream(
     LiteRtLmConversation* conversation, const char* message_json,
-    const char* extra_context, LiteRtLmStreamCallback callback,
-    void* callback_data);
+    const char* extra_context,
+    const LiteRtLmConversationOptionalArgs* optional_args,
+    LiteRtLmStreamCallback callback, void* callback_data);
 
 // Renders the message into a string according to the template.
 //

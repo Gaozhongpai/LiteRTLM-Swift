@@ -1,674 +1,243 @@
 # LiteRTLM-Swift
 
-Swift package for running [LiteRT-LM](https://ai.google.dev/edge/litert/lm) models on iOS. Wraps Google's C API in a clean, async/await Swift interface.
+Swift wrapper for running LiteRT-LM models on iOS.
 
-Supports **text generation**, **vision (image understanding)**, **audio (speech/sound understanding)**, and **streaming** with models like **Gemma 4 E2B**.
+This fork is intentionally **Conversation API first**. MiloFlow uses it for stateful local chat, multimodal turns, tool calling, eager preface prewarm, and runtime-probed conversation cloning.
 
-> **Note:** This is a community project, not an official Google product. The included `CLiteRTLM.xcframework` is built from Google's open-source [LiteRT-LM](https://github.com/google-ai-edge/LiteRT-LM) C API (Apache 2.0).
->
-> **Advanced conversation branching:** the Swift source now includes branch-management APIs built around LiteRT-LM conversation cloning. To use them, rebuild `CLiteRTLM.xcframework` from the updated LiteRT-LM C API so the `litert_lm_conversation_clone` and `litert_lm_conversation_config_set_prefill_preface_on_init` symbols are present.
->
-> Cloning is implemented by `SessionAdvanced` only — `SessionBasic` returns `UnimplementedError`. The Swift engine probes once at `load()` and exposes the result as `engine.supportsConversationClone`. Gate any branch-management calls on that flag; on `false`, fall back to opening a fresh conversation per chat.
->
-> **Eager preface prefill:** every `openConversation` and `openConversationBranch` now opts into `prefill_preface_on_init=true`. The model forward pass over the system prompt + history runs at conversation-create time, so prewarms actually warm the KV cache and the first user turn pays only the new turn's prefill. Empty prefaces are a no-op.
+## Supported Path
+
+Use `LiteRTLMEngine` with the persistent Conversation APIs:
+
+```swift
+let engine = LiteRTLMEngine(modelPath: modelURL)
+try await engine.load()
+
+try await engine.openConversation(
+    systemPrompt: "You are Milo, an on-device assistant.",
+    historyJSON: restoredHistoryJSON,
+    tools: sharedTools
+)
+
+let reply = try await engine.conversationSendText("Help me plan today.")
+```
+
+This path handles prompt formatting internally and supports:
+
+- text turns
+- image turns
+- audio turns
+- mixed multimodal turns
+- tool calls and tool results
+- system prompt, tools, and restored-history prewarm
+- stored conversation branches and clone activation
+
+The older one-shot and Session APIs still compile for compatibility and fallback flows, but they are not the recommended MiloFlow integration path because they require manual prompt formatting and do not support the full conversation state model.
 
 ## Requirements
 
 - iOS 17.0+
 - Xcode 16+
-- iPhone 13 Pro or later (6 GB+ RAM required for Gemma 4 E2B)
-- `increased-memory-limit` entitlement (model loading needs ~4 GB RAM)
+- iPhone 13 Pro or later for Gemma 4 E2B class models
+- `com.apple.developer.kernel.increased-memory-limit`
 
-<details>
-<summary>How to add the increased-memory-limit entitlement</summary>
-
-In Xcode: select your app target > Signing & Capabilities > + Capability > search "Increased Memory Limit".
-
-Or add manually to your `.entitlements` file:
-
-```xml
-<key>com.apple.developer.kernel.increased-memory-limit</key>
-<true/>
-```
-
-Without this entitlement the system may kill your app during model loading.
-
-</details>
-
-## Installation
-
-### Swift Package Manager
-
-Add to your `Package.swift`:
+## Engine Setup
 
 ```swift
-dependencies: [
-    .package(url: "https://github.com/mylovelycodes/LiteRTLM-Swift.git", from: "0.1.0")
-],
-targets: [
-    .target(
-        name: "YourApp",
-        dependencies: [
-            .product(name: "LiteRTLMSwift", package: "LiteRTLM-Swift")
-        ]
-    )
-]
+let engine = LiteRTLMEngine(
+    modelPath: modelURL,
+    backend: "cpu",
+    enabledModalities: [.vision, .audio]
+)
+
+try await engine.load()
 ```
 
-Or in Xcode: File > Add Package Dependencies > paste the repo URL > add `LiteRTLMSwift` to your target.
+`backend: "gpu"` is available but should be treated as experimental on iOS. Text may use GPU when supported; vision/audio executor sections are still loaded conservatively.
 
-## Quick Start
+## Conversation Turns
 
-A complete end-to-end example:
+### Text
 
 ```swift
-import LiteRTLMSwift
-
-// 1. Download model (~2.6 GB, only needed once)
-let downloader = ModelDownloader()
-try await downloader.download()  // defaults to Gemma 4 E2B from HuggingFace
-
-// 2. Load engine
-let engine = LiteRTLMEngine(modelPath: downloader.modelPath)
-try await engine.load()  // takes ~5-10s on first launch
-
-// 3. Generate text
-let response = try await engine.generate(
-    prompt: "<|turn>user\nWhat is Swift?\n<turn|>\n<|turn>model\n",
-    temperature: 0.7,
-    maxTokens: 256
-)
-print(response)
-
-// 4. Vision (image understanding)
-let imageData = try Data(contentsOf: photoURL)
-let caption = try await engine.vision(
-    imageData: imageData,  // JPEG, PNG, or HEIC
-    prompt: "Describe this photo.",
-    maxTokens: 512
-)
-print(caption)
-
-// 5. Audio (speech/sound understanding)
-let audioData = try Data(contentsOf: audioURL)
-let transcript = try await engine.audio(
-    audioData: audioData,  // WAV, FLAC, or MP3
-    prompt: "Transcribe this audio.",
-    maxTokens: 512
-)
-print(transcript)
+let text = try await engine.conversationSendText("Summarize this project.")
 ```
 
-> **Important:** Text generation (`generate`, `generateStreaming`, `openSession`) requires Gemma 4's turn marker format in the prompt (see [Prompt Format](#gemma-4-prompt-format)). Vision, audio, and multimodal methods take plain text prompts — the Conversation API handles formatting internally.
-
-## More Examples
-
-### Streaming
+### Streaming Text
 
 ```swift
-for try await chunk in engine.generateStreaming(
-    prompt: "<|turn>user\nTell me a story.\n<turn|>\n<|turn>model\n"
-) {
+for try await chunk in engine.conversationSendTextStreaming("Write a short update.") {
     print(chunk, terminator: "")
 }
 ```
 
-### Multi-Image Vision
+### Images
 
 ```swift
-let answer = try await engine.visionMultiImage(
-    imagesData: [image1Data, image2Data],
-    prompt: "Compare these two photos.",
-    maxTokens: 1024
+let answer = try await engine.conversationSendImage(
+    imageData: jpegData,
+    prompt: "What is important in this image?",
+    visualTokenBudget: 512
 )
 ```
 
-### Audio Understanding
-
-Supports WAV, FLAC, and MP3. Audio is automatically resampled to 16 kHz mono internally.
+### Audio
 
 ```swift
-let audioData = try Data(contentsOf: recordingURL)
-
-// Transcription (default format: .wav)
-let text = try await engine.audio(
-    audioData: audioData,
-    prompt: "Transcribe this audio."
-)
-
-// MP3 file
-let mp3Data = try Data(contentsOf: mp3URL)
-let summary = try await engine.audio(
-    audioData: mp3Data,
-    prompt: "Summarize what is being said.",
-    format: .mp3,
-    maxTokens: 1024
+let transcript = try await engine.conversationSendAudio(
+    audioData: wavData,
+    prompt: "Transcribe and summarize this audio.",
+    format: .wav
 )
 ```
 
-### Combined Audio + Vision (Multimodal)
-
-Analyze audio and images together in a single query:
+### Mixed Multimodal
 
 ```swift
-let response = try await engine.multimodal(
-    audioData: [audioTrackData],
-    imagesData: [keyframeData],
-    prompt: "Does the speaker's description match what's shown in the image?"
+let response = try await engine.conversationSendMultimodal(
+    audioData: [meetingAudio],
+    imagesData: [whiteboardPhoto],
+    prompt: "Connect the audio discussion with the whiteboard.",
+    visualTokenBudget: 512
 )
 ```
 
-### Persistent Conversation with Images / Audio / Mixed Turns
+## Tool Calling
 
-The Conversation API can keep multimodal state warm across turns:
+Open the conversation with tool declarations, then use the tool-aware turn APIs:
 
 ```swift
 try await engine.openConversation(
-    systemPrompt: "You are a helpful multimodal assistant."
-)
-
-let textReply = try await engine.conversationSendText("What should I look for?")
-
-let imageReply = try await engine.conversationSendImage(
-    imageData: photoData,
-    prompt: "What stands out in this image?"
-)
-
-let multimodalReply = try await engine.conversationSendMultimodal(
-    audioData: [audioClipData],
-    imagesData: [frame1Data, frame2Data],
-    prompt: "Do these video frames match what the speaker is describing?"
-)
-```
-
-If your source is a video, extract representative frames in your app and pass
-them as `imagesData`. `LiteRTLM-Swift` does not decode video containers itself.
-
-### Tool-Enabled Conversations
-
-The persistent Conversation API also supports native tool calling when you open
-the conversation with `tools:`.
-
-```swift
-try await engine.openConversation(
-    systemPrompt: "You help manage tasks.",
+    systemPrompt: systemPrompt,
     tools: [
         ToolDeclaration(
             name: "set_title",
-            description: "Set the workspace title.",
+            description: "Set the current workspace title.",
             parametersJSON: titleSchemaJSON
         )
     ]
 )
 
-let turn = try await engine.conversationSendTextWithTools(
-    "Please title this chat after the user's request."
-)
+let turn = try await engine.conversationSendTextWithTools("Name this workspace.")
 
 switch turn {
 case .text(let text):
     print(text)
 case .toolCalls(let calls):
-    let results = calls.compactMap { call in
-        ToolResult(toolName: call.name, content: ["ok": true])
+    let results = calls.map { call in
+        ToolResult(toolName: call.name, contentJSON: #"{"ok":true}"#)
     }
     let followUp = try await engine.conversationSendToolResults(results)
     print(followUp)
 }
 ```
 
-### Multi-Turn Chat (KV Cache Reuse)
+Tool-enabled conversations set `filterChannelContentFromKVCache` so tool channel content does not pollute the reusable KV cache.
 
-For multi-turn conversations, use the persistent session API. The KV cache is preserved across turns, reducing time-to-first-token from ~20s to ~1-2s on follow-up messages.
+## Prewarm
 
-```swift
-// Open a persistent session
-try await engine.openSession(temperature: 0.7, maxTokens: 512)
-
-// First turn — full prefill (~15-20s TTFT)
-for try await chunk in engine.sessionGenerateStreaming(
-    input: "<|turn>user\nHello!\n<turn|>\n<|turn>model\n"
-) {
-    print(chunk, terminator: "")
-}
-
-// Second turn — incremental prefill (~1-2s TTFT)
-for try await chunk in engine.sessionGenerateStreaming(
-    input: "<turn|>\n<|turn>user\nTell me more.\n<turn|>\n<|turn>model\n"
-) {
-    print(chunk, terminator: "")
-}
-
-// Clean up when done
-engine.closeSession()
-```
-
-### Conversation Branching (Shared Base / Template Prefill)
-
-If your app has multiple page-specific assistants that all share a common base
-context, prewarm that base once, store it as a branch, then clone from it:
-
-> Branch-management APIs require a backend that implements `Session::Clone` —
-> at the time of writing only `SessionAdvanced` does. Check
-> `engine.supportsConversationClone` before calling these APIs and fall back to
-> per-chat `openConversation` when it is `false`.
+`openConversation` and `openConversationBranch` opt into eager preface prefill:
 
 ```swift
-// Open and prewarm a reusable base conversation branch.
-try await engine.openConversationBranch(
-    "base",
-    systemPrompt: "You are Milo, an on-device assistant.",
-    historyJSON: priorHistoryJSON,
-    tools: sharedTools
-)
-
-// Clone base -> milo and base -> project without paying full prefill twice.
-try await engine.cloneConversationBranch("base", as: "milo")
-try await engine.cloneConversationBranch("base", as: "project")
-
-// Activate the branch you want to use for normal conversationSend* APIs.
-try await engine.activateConversationBranch("milo")
-let reply = try await engine.conversationSendText("Let's keep this casual.")
-
-// Later, switch to a different branch by activating it.
-try await engine.activateConversationBranch("project")
+litert_lm_conversation_config_set_prefill_preface_on_init(config, true)
 ```
 
-This is the recommended pattern for apps that need fast switching between
-multiple conversation personas or workspaces while staying on the Conversation
-API.
+That means system prompt, tools, and restored history are prefetched into the KV cache at conversation creation time. First user turn latency then pays only for the new user turn plus decode.
 
-A useful variant is a **shared blank template**:
+Official upstream LiteRT-LM already has the native C++ `ConversationConfig::Builder().SetPrefillPrefaceOnInit(...)` path. The C setter is added only while packaging the xcframework, so the upstream source checkout remains clean.
 
-- prewarm one hidden branch for a reusable "blank chat" or "blank project"
-  shape
-- activate that template for fast first-entry warmup
-- on the first real user turn, clone the template into the workspace's real
-  stored branch and continue there
+## Conversation Branching
 
-That keeps first-use latency low without forcing every untouched new workspace
-to consume its own long-lived stored branch immediately.
-
-### Download Progress Tracking
-
-`ModelDownloader` is `@Observable`, so you can bind directly in SwiftUI:
+Branching is automatic when supported by the loaded backend:
 
 ```swift
-struct DownloadView: View {
-    @State private var downloader = ModelDownloader()
+if engine.supportsConversationClone {
+    try await engine.openConversationBranch(
+        "base",
+        systemPrompt: systemPrompt,
+        historyJSON: restoredHistoryJSON,
+        tools: sharedTools
+    )
 
-    var body: some View {
-        switch downloader.status {
-        case .notStarted:
-            Button("Download Model (\(downloader.totalBytesDisplay))") {
-                Task { try await downloader.download() }
-            }
-        case .downloading(let progress):
-            ProgressView(value: progress)
-            Text("\(downloader.downloadedBytesDisplay) / \(downloader.totalBytesDisplay)")
-            Button("Pause") { downloader.pause() }
-        case .paused:
-            Button("Resume") { Task { try await downloader.download() } }
-        case .completed:
-            Text("Model ready!")
-        case .failed(let msg):
-            Text("Error: \(msg)")
-            Button("Retry") { Task { try await downloader.download() } }
-        }
-    }
+    try await engine.cloneConversationBranch("base", as: "project")
+    try await engine.activateConversationBranch("project")
 }
 ```
 
-### SwiftUI: Engine Status
+`supportsConversationClone` is probed once during `load()`. Current upstream exposes `litert_lm_conversation_clone`; supported `SessionAdvanced` loads can clone, while `SessionBasic` still returns unsupported. Callers must fall back to `openConversation` when the probe is false.
 
-```swift
-struct EngineView: View {
-    @State private var engine: LiteRTLMEngine
+MiloFlow enables the branch path in app code and automatically disables it if the runtime probe fails.
 
-    init() {
-        let path = ModelDownloader().modelPath
-        _engine = State(initialValue: LiteRTLMEngine(modelPath: path))
-    }
+## Public Surface
 
-    var body: some View {
-        Group {
-            switch engine.status {
-            case .notLoaded:
-                Button("Load Model") { Task { try await engine.load() } }
-            case .loading:
-                ProgressView("Loading model...")
-            case .ready:
-                Text("Ready for inference!")
-            case .error(let msg):
-                Text("Error: \(msg)")
-            }
-        }
-    }
-}
-```
+Primary API:
 
-## API Reference
+| API | Purpose |
+| --- | --- |
+| `load()` / `unload()` | Engine lifecycle |
+| `openConversation(...)` | Open a stateful text/multimodal/tool conversation |
+| `closeConversation()` / `closeConversationAndWait()` | Release persistent conversation state |
+| `conversationSendText(...)` | Text turn |
+| `conversationSendTextStreaming(...)` | Streaming text turn |
+| `conversationSendTextWithTools(...)` | Tool-aware text turn |
+| `conversationSendToolResults(...)` | Return tool results |
+| `conversationSendImage(...)` / `conversationSendImages(...)` | Image turns |
+| `conversationSendAudio(...)` | Audio turn |
+| `conversationSendMultimodal(...)` | Mixed audio/image turn |
+| `cancelActiveConversationProcess()` | Cancel active conversation work |
+| `openConversationBranch(...)` | Create a prewarmed stored branch |
+| `saveConversationBranch(...)` | Clone current conversation into a stored branch |
+| `cloneConversationBranch(_:as:)` | Clone stored branch to another stored branch |
+| `activateConversationBranch(...)` | Clone stored branch into the active conversation slot |
+| `supportsConversationClone` | Runtime clone capability probe |
 
-### LiteRTLMEngine
+Compatibility API:
 
-| Method | Description |
-|--------|-------------|
-| `init(modelPath:backend:)` | Create engine. `backend`: `"cpu"` (default, recommended) or `"gpu"` (experimental, Metal) |
-| `load()` | Load the `.litertlm` model. Call once, reuse across inferences |
-| `unload()` | Free model memory |
-| `generate(prompt:temperature:maxTokens:)` | One-shot text generation. Prompt must use Gemma turn markers |
-| `generateStreaming(prompt:temperature:maxTokens:)` | Streaming text generation |
-| `vision(imageData:prompt:temperature:maxTokens:maxImageDimension:)` | Single-image understanding. Plain text prompt |
-| `visionMultiImage(imagesData:prompt:temperature:maxTokens:maxImageDimension:)` | Multi-image understanding |
-| `audio(audioData:prompt:format:temperature:maxTokens:)` | Audio understanding (WAV, FLAC, MP3). Plain text prompt |
-| `multimodal(audioData:audioFormat:imagesData:prompt:temperature:maxTokens:maxImageDimension:)` | Combined audio + vision inference |
-| `openSession(temperature:maxTokens:)` | Open persistent session for multi-turn chat (KV cache reuse) |
-| `sessionGenerateStreaming(input:)` | Stream generation using persistent session |
-| `closeSession()` | Close persistent session, free KV cache |
-| `openConversation(systemPrompt:historyJSON:tools:temperature:maxTokens:)` | Open a persistent multimodal Conversation |
-| `closeConversation()` | Close the persistent Conversation |
-| `conversationSendText(_:)` | Send a text turn through the persistent Conversation |
-| `conversationSendTextStreaming(_:)` | Stream a text turn through the persistent Conversation |
-| `conversationSendTextWithTools(_:)` | Send a text turn and receive either text or parsed tool calls |
-| `conversationSendToolResults(_:)` | Send tool results back into the persistent Conversation |
-| `conversationSendTextWithToolsStreaming(_:)` | Stream `ConversationTurn` events from a tool-enabled Conversation |
-| `conversationSendToolResultsStreaming(_:)` | Stream the follow-up turn after returning tool results |
-| `conversationSendAudio(audioData:prompt:format:)` | Send an audio turn through the persistent Conversation |
-| `conversationSendAudioStreaming(audioData:prompt:format:)` | Stream an audio turn through the persistent Conversation |
-| `conversationSendImage(imageData:prompt:maxImageDimension:)` | Send a single image turn through the persistent Conversation |
-| `conversationSendImageStreaming(imageData:prompt:maxImageDimension:)` | Stream a single image turn through the persistent Conversation |
-| `conversationSendImages(imagesData:prompt:maxImageDimension:)` | Send a multi-image turn through the persistent Conversation |
-| `conversationSendImagesStreaming(imagesData:prompt:maxImageDimension:)` | Stream a multi-image turn through the persistent Conversation |
-| `conversationSendMultimodal(audioData:audioFormat:imagesData:prompt:maxImageDimension:)` | Send a mixed audio + image turn through the persistent Conversation |
-| `conversationSendMultimodalStreaming(audioData:audioFormat:imagesData:prompt:maxImageDimension:)` | Stream a mixed audio + image turn through the persistent Conversation |
-| `openConversationBranch(_:systemPrompt:historyJSON:tools:temperature:maxTokens:)` | Create and store a named prewarmed conversation branch |
-| `saveConversationBranch(_:)` | Clone the current persistent conversation into a stored branch |
-| `cloneConversationBranch(_:as:)` | Clone one stored branch into another |
-| `activateConversationBranch(_:)` | Clone a stored branch into the persistent conversation slot |
-| `deleteConversationBranch(_:)` | Delete a stored branch and free its native resources |
-| `hasConversationBranch(_:)` | Check whether a stored branch exists |
+| API | Replacement |
+| --- | --- |
+| `generate(...)`, `generateStreaming(...)` | `openConversation` + `conversationSendText...` |
+| `vision(...)`, `visionMultiImage(...)` | `conversationSendImage...` |
+| `audio(...)` | `conversationSendAudio...` |
+| `multimodal(...)` | `conversationSendMultimodal...` |
+| `openSession(...)`, `sessionGenerateStreaming(...)`, `sessionPrefill(...)` | Conversation APIs |
+| `tokenize(...)`, `detokenize(...)` | Diagnostics only |
+| `ModelDownloader` | Demo/helper only; MiloFlow owns its model asset flow |
 
-| Property | Type | Description |
-|----------|------|-------------|
-| `status` | `Status` | `.notLoaded`, `.loading`, `.ready`, or `.error(String)` |
-| `isReady` | `Bool` | Whether the engine is ready for inference |
-| `supportsConversationClone` | `Bool` | Whether the loaded backend implements `Session::Clone`. Probed once at `load()`. `false` on `SessionBasic`. Branch-management APIs (`saveConversationBranch`, `cloneConversationBranch`, `activateConversationBranch`) require `true` |
+## Building The XCFramework
 
-### ModelDownloader
-
-| Method | Description |
-|--------|-------------|
-| `init(modelsDirectory:)` | Create downloader. Default path: `~/Library/Application Support/LiteRTLM/Models/` |
-| `download(from:)` | Download model from URL. Defaults to `defaultModelURL` (HuggingFace) |
-| `pause()` | Pause download. Resume data is persisted to disk |
-| `cancel()` | Cancel download and discard resume data |
-| `deleteModel()` | Delete the downloaded model file |
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `status` | `DownloadStatus` | Current download state |
-| `progress` | `Double` | 0.0 to 1.0 |
-| `isDownloaded` | `Bool` | Whether the model file exists on disk |
-| `modelPath` | `URL` | Full path to model file (use with `LiteRTLMEngine(modelPath:)`) |
-
-### Gemma 4 Prompt Format
-
-The **Session API** (text generation) requires Gemma 4's native turn marker format. The **Conversation API** does NOT — just pass plain text.
-
-```
-<|turn>user
-Your message here
-<turn|>
-<|turn>model
-```
-
-With system prompt:
-
-```
-<|turn>system
-You are a helpful assistant.
-<turn|>
-<|turn>user
-Hello!
-<turn|>
-<|turn>model
-```
-
-Multi-turn (for persistent session — only send the NEW content each turn):
-
-```
-# First turn input:
-<|turn>user
-Hello!
-<turn|>
-<|turn>model
-
-# Second turn input (note the closing marker from previous model turn):
-<turn|>
-<|turn>user
-Tell me more.
-<turn|>
-<|turn>model
-```
-
-## Architecture
-
-```
-┌──────────────────────────────────────────────┐
-│                Your App                      │
-├──────────────────────────────────────────────┤
-│             LiteRTLMSwift                    │
-│  ┌─────────────────┐  ┌──────────────────┐   │
-│  │ LiteRTLMEngine  │  │ ModelDownloader  │   │
-│  │                 │  │                  │   │
-│  │ .generate()     │  │ .download()      │   │
-│  │ .vision()       │  │ .pause()         │   │
-│  │ .audio()        │  │ .cancel()        │   │
-│  │ .multimodal()   │  │                  │   │
-│  │ .openSession()  │  │                  │   │
-│  └────────┬────────┘  └──────────────────┘   │
-│           │                                  │
-│     Serial DispatchQueue                     │
-│     (thread safety)                          │
-├───────────┼──────────────────────────────────┤
-│     CLiteRTLM.xcframework (C API)            │
-│           │                                  │
-│   Session API          Conversation API      │
-│   (text in/out)        (multimodal JSON)     │
-│                                              │
-│   For text generation  For vision / audio /  │
-│   Raw prompt format    multimodal inference  │
-└──────────────────────────────────────────────┘
-```
-
-- **Session API** — raw text prompts via `InputData`. You control the prompt format. Used by `generate()`, `generateStreaming()`, `openSession()`.
-- **Conversation API** — JSON-based messages with image/audio file paths. Handles image decode/resize/patchify and audio decode/resample/mel-spectrogram internally. Used by `vision()`, `visionMultiImage()`, `audio()`, `multimodal()`.
-- **Conversation branching** — keep a shared prewarmed base conversation, clone it into page-specific branches, then activate whichever branch should back the current UI.
-- All C API calls are serialized on a single `DispatchQueue` for thread safety. LiteRT-LM supports only one active session at a time.
-
-## Building the XCFramework from Source
-
-This repo ships a prebuilt `CLiteRTLM.xcframework`. If you want to build it yourself (e.g. to pick up upstream fixes or try the GPU backend), follow the steps below.
-
-### Prerequisites
-
-| Tool | Version | Install |
-|------|---------|---------|
-| Bazel | 7.6.1 | `brew install bazelisk` (auto-downloads correct version) |
-| Xcode | 16+ | Mac App Store |
-| Disk space | ~20 GB | Bazel build cache |
-
-### Option A: Build Script
+Use the script:
 
 ```bash
-# Clones LiteRT-LM source automatically and builds xcframework
-./scripts/build-xcframework.sh
-
-# Or point to an existing local checkout
-./scripts/build-xcframework.sh ~/Dev/LiteRT-LM
+./scripts/build-xcframework.sh /path/to/LiteRT-LM
 ```
 
-The script will:
-1. Clone (or use existing) [google-ai-edge/LiteRT-LM](https://github.com/google-ai-edge/LiteRT-LM) source
-2. Build `libLiteRTLMEngine.dylib` for `ios_arm64` (device) and `ios_sim_arm64` (simulator)
-3. Package both into `Frameworks/LiteRTLM.xcframework`
+When the input checkout is official upstream, the script temporarily injects:
 
-### Option B: Manual Step-by-Step
+- `//c:libLiteRTLMEngine.dylib`
+- `litert_lm_conversation_config_set_prefill_preface_on_init`
 
-#### 1. Clone LiteRT-LM source
+The script restores `c/BUILD`, `c/engine.cc`, and `c/engine.h` before exit. This keeps `ThirdParty/LiteRT-LM` merge-friendly while producing the iOS framework MiloFlow needs.
+
+Verify exported symbols:
 
 ```bash
-git clone https://github.com/google-ai-edge/LiteRT-LM.git
-cd LiteRT-LM
+nm -gU Frameworks/LiteRTLM.xcframework/ios-arm64/CLiteRTLM.framework/CLiteRTLM \
+  | rg "litert_lm_conversation_clone|litert_lm_conversation_config_set_prefill_preface_on_init"
 ```
 
-#### 2. Build for iOS device (arm64)
+Expected:
 
-```bash
-bazel build --config=ios_arm64 //c:libLiteRTLMEngine.dylib
+```text
+_litert_lm_conversation_clone
+_litert_lm_conversation_config_set_prefill_preface_on_init
 ```
 
-Output: `bazel-bin/c/libLiteRTLMEngine.dylib`
+## Notes
 
-The Bazel build target is defined in [`c/BUILD`](https://github.com/google-ai-edge/LiteRT-LM/blob/main/c/BUILD):
-- `linkshared = True` + `linkstatic = True` — produces a self-contained dylib with all C++ deps statically linked
-- `-Wl,-exported_symbol,_litert_lm_*` — only exports the public C API symbols
-
-#### 3. Build for iOS simulator (arm64)
-
-```bash
-# Save device dylib first (Bazel overwrites bazel-bin between configs)
-cp bazel-bin/c/libLiteRTLMEngine.dylib /tmp/libLiteRTLMEngine-device.dylib
-
-bazel build --config=ios_sim_arm64 //c:libLiteRTLMEngine.dylib
-cp bazel-bin/c/libLiteRTLMEngine.dylib /tmp/libLiteRTLMEngine-sim.dylib
-```
-
-Available iOS configs in `.bazelrc`:
-
-| Config | Architecture | Use Case |
-|--------|-------------|----------|
-| `ios_arm64` | arm64 | Physical device |
-| `ios_sim_arm64` | arm64 | Apple Silicon simulator |
-| `ios_x86_64` | x86_64 | Intel Mac simulator |
-| `ios_arm64e` | arm64e | A12+ with pointer auth |
-
-#### 4. Package as .framework bundles
-
-Each architecture needs to be wrapped in a `.framework` bundle before creating the xcframework.
-
-```bash
-# Device framework
-mkdir -p /tmp/ios-arm64/CLiteRTLM.framework/{Headers,Modules}
-cp /tmp/libLiteRTLMEngine-device.dylib /tmp/ios-arm64/CLiteRTLM.framework/CLiteRTLM
-install_name_tool -id "@rpath/CLiteRTLM.framework/CLiteRTLM" /tmp/ios-arm64/CLiteRTLM.framework/CLiteRTLM
-cp prebuilt/ios_arm64/libGemmaModelConstraintProvider.dylib /tmp/ios-arm64/CLiteRTLM.framework/
-install_name_tool -change "@rpath/libGemmaModelConstraintProvider.dylib" "@loader_path/libGemmaModelConstraintProvider.dylib" /tmp/ios-arm64/CLiteRTLM.framework/CLiteRTLM
-
-# Simulator framework
-mkdir -p /tmp/ios-arm64-simulator/CLiteRTLM.framework/{Headers,Modules}
-cp /tmp/libLiteRTLMEngine-sim.dylib /tmp/ios-arm64-simulator/CLiteRTLM.framework/CLiteRTLM
-install_name_tool -id "@rpath/CLiteRTLM.framework/CLiteRTLM" /tmp/ios-arm64-simulator/CLiteRTLM.framework/CLiteRTLM
-cp prebuilt/ios_sim_arm64/libGemmaModelConstraintProvider.dylib /tmp/ios-arm64-simulator/CLiteRTLM.framework/
-install_name_tool -change "@rpath/libGemmaModelConstraintProvider.dylib" "@loader_path/libGemmaModelConstraintProvider.dylib" /tmp/ios-arm64-simulator/CLiteRTLM.framework/CLiteRTLM
-```
-
-Copy headers (from the LiteRT-LM source `c/` directory):
-
-```bash
-for DIR in /tmp/ios-arm64 /tmp/ios-arm64-simulator; do
-    cp c/engine.h "$DIR/CLiteRTLM.framework/Headers/"
-    cp c/litert_lm_logging.h "$DIR/CLiteRTLM.framework/Headers/"
-done
-```
-
-Create `module.modulemap` (same for both):
-
-```bash
-for DIR in /tmp/ios-arm64 /tmp/ios-arm64-simulator; do
-    cat > "$DIR/CLiteRTLM.framework/Modules/module.modulemap" << 'EOF'
-framework module CLiteRTLM {
-    header "engine.h"
-    export *
-}
-EOF
-done
-```
-
-Create `Info.plist` (same for both):
-
-```bash
-for DIR in /tmp/ios-arm64 /tmp/ios-arm64-simulator; do
-    cat > "$DIR/CLiteRTLM.framework/Info.plist" << 'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleExecutable</key>
-    <string>CLiteRTLM</string>
-    <key>CFBundleIdentifier</key>
-    <string>com.google.CLiteRTLM</string>
-    <key>CFBundleInfoDictionaryVersion</key>
-    <string>6.0</string>
-    <key>CFBundleName</key>
-    <string>CLiteRTLM</string>
-    <key>CFBundlePackageType</key>
-    <string>FMWK</string>
-    <key>CFBundleVersion</key>
-    <string>1.0</string>
-    <key>MinimumOSVersion</key>
-    <string>13.0</string>
-</dict>
-</plist>
-EOF
-done
-```
-
-Ad-hoc code sign nested binaries before the framework bundle:
-
-```bash
-codesign --force --sign - /tmp/ios-arm64/CLiteRTLM.framework/libGemmaModelConstraintProvider.dylib
-codesign --force --sign - /tmp/ios-arm64/CLiteRTLM.framework/CLiteRTLM
-codesign --force --sign - /tmp/ios-arm64-simulator/CLiteRTLM.framework/libGemmaModelConstraintProvider.dylib
-codesign --force --sign - /tmp/ios-arm64-simulator/CLiteRTLM.framework/CLiteRTLM
-```
-
-#### 5. Create the xcframework
-
-```bash
-xcodebuild -create-xcframework \
-    -framework /tmp/ios-arm64/CLiteRTLM.framework \
-    -framework /tmp/ios-arm64-simulator/CLiteRTLM.framework \
-    -output Frameworks/LiteRTLM.xcframework
-```
-
-#### 6. Verify
-
-```bash
-# Check architectures
-file Frameworks/LiteRTLM.xcframework/ios-arm64/CLiteRTLM.framework/CLiteRTLM
-# -> Mach-O 64-bit dynamically linked shared library arm64
-
-file Frameworks/LiteRTLM.xcframework/ios-arm64-simulator/CLiteRTLM.framework/CLiteRTLM
-# -> Mach-O 64-bit dynamically linked shared library arm64 (simulator)
-
-# Check exported symbols
-nm -gU Frameworks/LiteRTLM.xcframework/ios-arm64/CLiteRTLM.framework/CLiteRTLM | grep litert_lm
-# Should list all litert_lm_* public API functions
-```
-
-### Troubleshooting
-
-| Issue | Solution |
-|-------|----------|
-| `no such package '@build_bazel_apple_support'` | Run `bazel sync` to fetch external dependencies |
-| Xcode SDK not found | Ensure Xcode is selected: `sudo xcode-select -s /Applications/Xcode.app` |
-| Build takes very long | First build downloads ~10 GB of deps. Subsequent builds use cache |
-| `Undefined symbols` at link time | Make sure you're using `//c:libLiteRTLMEngine.dylib` target, not `//c:engine` |
-| Code signing errors | Use ad-hoc signing (`--sign -`) for development; real signing happens at app archive |
+- All native C API calls are serialized on an internal dispatch queue.
+- The wrapper is `@unchecked Sendable` because native handles are confined to that queue.
+- The included xcframework contains Google LiteRT-LM code under Apache 2.0.
+- This Swift wrapper is a community integration, not an official Google product.
 
 ## License
 
-MIT License. See [LICENSE](LICENSE).
-
-The `CLiteRTLM.xcframework` contains code from Google's LiteRT-LM project, licensed under the [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0).
+MIT License. See `LICENSE`.
