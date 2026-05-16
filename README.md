@@ -46,7 +46,9 @@ The older one-shot and Session APIs still compile for compatibility and fallback
 let engine = LiteRTLMEngine(
     modelPath: modelURL,
     backend: "cpu",
-    enabledModalities: [.vision, .audio]
+    enabledModalities: [.vision, .audio],
+    maxNumImages: 4,
+    enableBenchmarking: true
 )
 
 try await engine.load()
@@ -189,6 +191,7 @@ Primary API:
 | `cloneConversationBranch(_:as:)` | Clone stored branch to another stored branch |
 | `activateConversationBranch(...)` | Clone stored branch into the active conversation slot |
 | `supportsConversationClone` | Runtime clone capability probe |
+| `benchmarkSnapshot()` | Latest native LiteRT benchmark counters for diagnostics |
 
 Compatibility API:
 

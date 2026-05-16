@@ -73,6 +73,19 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         case error(String)
     }
 
+    public struct BenchmarkSnapshot: Sendable, Equatable {
+        public let timeToFirstTokenSeconds: Double
+        public let totalInitTimeSeconds: Double
+        public let prefillTurnCount: Int
+        public let decodeTurnCount: Int
+        public let totalPrefillTokens: Int
+        public let totalDecodeTokens: Int
+        public let latestPrefillTokens: Int?
+        public let latestDecodeTokens: Int?
+        public let latestPrefillTokensPerSecond: Double?
+        public let latestDecodeTokensPerSecond: Double?
+    }
+
     /// A piece of input for a persistent session turn.
     ///
     /// Use with `sessionGenerateStreaming(inputs:)` to send mixed text and audio
@@ -115,10 +128,13 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     private let speculativeDecodingPreference: Bool?
     private let parallelFileSectionLoading: Bool
     private let prefillChunkSize: Int?
+    private let maxNumImages: Int?
+    private let benchmarkingEnabled: Bool
     public let enabledModalities: EnabledModalities
 
     private var engine: OpaquePointer?  // LiteRtLmEngine*
     private var didWarmTextDecode = false
+    private var latestBenchmarkSnapshot: BenchmarkSnapshot?
     // The LiteRT-LM C runtime invokes streaming callbacks from its own worker
     // threads. Keep this coordinating queue at default QoS so its semaphore
     // wait does not create a user-initiated -> default priority inversion.
@@ -149,7 +165,9 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         enableSpeculativeDecoding: Bool? = nil,
         enabledModalities: EnabledModalities = .all,
         parallelFileSectionLoading: Bool = true,
-        prefillChunkSize: Int? = nil
+        prefillChunkSize: Int? = nil,
+        maxNumImages: Int? = nil,
+        enableBenchmarking: Bool = true
     ) {
         self.modelPath = modelPath
         self.backend = backend
@@ -157,6 +175,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         self.enabledModalities = enabledModalities
         self.parallelFileSectionLoading = parallelFileSectionLoading
         self.prefillChunkSize = prefillChunkSize
+        self.maxNumImages = maxNumImages
+        self.benchmarkingEnabled = enableBenchmarking
     }
 
     deinit {
@@ -241,6 +261,10 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                             litert_lm_engine_settings_set_prefill_chunk_size(settings, Int32(prefillChunkSize))
                         }
 
+                        if let maxNumImages = self.maxNumImages, maxNumImages > 0 {
+                            litert_lm_engine_settings_set_max_num_images(settings, Int32(maxNumImages))
+                        }
+
                         if enableSpeculativeDecoding {
                             litert_lm_engine_settings_set_enable_speculative_decoding(settings, true)
                         }
@@ -250,7 +274,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                         try? FileManager.default.createDirectory(atPath: cacheDir, withIntermediateDirectories: true)
                         litert_lm_engine_settings_set_cache_dir(settings, cacheDir)
 
-                        if Self.benchmarkLogsEnabled {
+                        if self.benchmarkingEnabled || Self.benchmarkLogsEnabled {
                             litert_lm_engine_settings_enable_benchmark(settings)
                         }
 
@@ -270,6 +294,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             inferenceQueue.sync {
                 self.engine = createdEngine
                 self.didWarmTextDecode = false
+                self.latestBenchmarkSnapshot = nil
             }
             isSpeculativeDecodingEnabled = enableSpeculativeDecoding
 
@@ -394,6 +419,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             if let eng = engine { litert_lm_engine_delete(eng) }
             engine = nil
             didWarmTextDecode = false
+            latestBenchmarkSnapshot = nil
         }
         supportsConversationClone = false
         isSpeculativeDecodingEnabled = false
@@ -864,6 +890,10 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             guard let conversation = chatConversation else { return }
             litert_lm_conversation_cancel_process(conversation)
         }
+    }
+
+    public func benchmarkSnapshot() -> BenchmarkSnapshot? {
+        inferenceQueue.sync { latestBenchmarkSnapshot }
     }
 
     /// Create and store a named conversation branch.
@@ -2034,11 +2064,57 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     }
 
     private func logSessionBenchmark(_ session: OpaquePointer) {
-        _ = session
+        guard let info = litert_lm_session_get_benchmark_info(session) else { return }
+        defer { litert_lm_benchmark_info_delete(info) }
+        latestBenchmarkSnapshot = Self.makeBenchmarkSnapshot(info)
     }
 
     private func logConversationBenchmark(_ conversation: OpaquePointer) {
-        _ = conversation
+        guard let info = litert_lm_conversation_get_benchmark_info(conversation) else { return }
+        defer { litert_lm_benchmark_info_delete(info) }
+        latestBenchmarkSnapshot = Self.makeBenchmarkSnapshot(info)
+    }
+
+    private nonisolated static func makeBenchmarkSnapshot(_ info: OpaquePointer) -> BenchmarkSnapshot {
+        let prefillTurnCount = max(0, Int(litert_lm_benchmark_info_get_num_prefill_turns(info)))
+        let decodeTurnCount = max(0, Int(litert_lm_benchmark_info_get_num_decode_turns(info)))
+
+        var totalPrefillTokens = 0
+        var totalDecodeTokens = 0
+        for index in 0..<prefillTurnCount {
+            totalPrefillTokens += max(0, Int(litert_lm_benchmark_info_get_prefill_token_count_at(info, Int32(index))))
+        }
+        for index in 0..<decodeTurnCount {
+            totalDecodeTokens += max(0, Int(litert_lm_benchmark_info_get_decode_token_count_at(info, Int32(index))))
+        }
+
+        let latestPrefillIndex = prefillTurnCount - 1
+        let latestDecodeIndex = decodeTurnCount - 1
+        let latestPrefillTokens = latestPrefillIndex >= 0
+            ? max(0, Int(litert_lm_benchmark_info_get_prefill_token_count_at(info, Int32(latestPrefillIndex))))
+            : nil
+        let latestDecodeTokens = latestDecodeIndex >= 0
+            ? max(0, Int(litert_lm_benchmark_info_get_decode_token_count_at(info, Int32(latestDecodeIndex))))
+            : nil
+        let latestPrefillTokensPerSecond = latestPrefillIndex >= 0
+            ? litert_lm_benchmark_info_get_prefill_tokens_per_sec_at(info, Int32(latestPrefillIndex))
+            : nil
+        let latestDecodeTokensPerSecond = latestDecodeIndex >= 0
+            ? litert_lm_benchmark_info_get_decode_tokens_per_sec_at(info, Int32(latestDecodeIndex))
+            : nil
+
+        return BenchmarkSnapshot(
+            timeToFirstTokenSeconds: litert_lm_benchmark_info_get_time_to_first_token(info),
+            totalInitTimeSeconds: litert_lm_benchmark_info_get_total_init_time_in_second(info),
+            prefillTurnCount: prefillTurnCount,
+            decodeTurnCount: decodeTurnCount,
+            totalPrefillTokens: totalPrefillTokens,
+            totalDecodeTokens: totalDecodeTokens,
+            latestPrefillTokens: latestPrefillTokens,
+            latestDecodeTokens: latestDecodeTokens,
+            latestPrefillTokensPerSecond: latestPrefillTokensPerSecond,
+            latestDecodeTokensPerSecond: latestDecodeTokensPerSecond
+        )
     }
 
     // MARK: - Private: Conversation-based Inference (Vision / Audio / Multimodal)
