@@ -293,7 +293,11 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         }
 
         for name in iOSGpuRuntimeDylibs {
-            let url = frameworkURL.appendingPathComponent(name)
+            guard let url = runtimeDylibURL(named: name, frameworkURL: frameworkURL) else {
+                log.warning("LiteRT GPU runtime dylib missing: \(name)")
+                continue
+            }
+
             guard FileManager.default.fileExists(atPath: url.path) else {
                 log.warning("LiteRT GPU runtime dylib missing: \(name)")
                 continue
@@ -317,6 +321,22 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         }
         #endif
         return nil
+    }
+
+    private static func runtimeDylibURL(named name: String, frameworkURL: URL) -> URL? {
+        let candidates = [
+            frameworkURL.appendingPathComponent(name),
+            frameworkURL.deletingLastPathComponent().appendingPathComponent(name),
+            Bundle.main.privateFrameworksURL?.appendingPathComponent(name),
+            Bundle.main.executableURL?
+                .deletingLastPathComponent()
+                .appendingPathComponent("Frameworks")
+                .appendingPathComponent(name),
+        ]
+
+        return candidates.compactMap { $0 }.first {
+            FileManager.default.fileExists(atPath: $0.path)
+        }
     }
 
     private func ensureModalityEnabled(_ modality: EnabledModalities, name: String) throws {
