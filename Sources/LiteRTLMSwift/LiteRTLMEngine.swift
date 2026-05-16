@@ -145,8 +145,16 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     private static let log = Logger(subsystem: "LiteRTLMSwift", category: "Engine")
     private static let benchmarkLogsEnabled = false
     private static let mtpDrafterMarker = Data("tf_lite_mtp_drafter".utf8)
-    private static let iOSGpuRuntimeDylibs = [
-        "libLiteRtMetalAccelerator.dylib",
+    private struct RuntimePlugin {
+        let dylibName: String
+        let wrappedFrameworkName: String
+    }
+
+    private static let iOSGpuRuntimePlugins = [
+        RuntimePlugin(
+            dylibName: "libLiteRtMetalAccelerator.dylib",
+            wrappedFrameworkName: "LiteRtMetalAccelerator"
+        ),
     ]
 
     // MARK: - Init
@@ -279,8 +287,12 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                             litert_lm_engine_settings_set_enable_speculative_decoding(settings, true)
                         }
 
-                        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
-                            .appendingPathComponent("litertlm_cache").path
+                        let cacheDir = Self.cacheDirectory(
+                            backend: backendStr,
+                            modalities: self.enabledModalities,
+                            maxNumTokens: max(1, self.maxNumTokens),
+                            speculativeDecodingEnabled: enableSpeculativeDecoding
+                        ).path
                         try? FileManager.default.createDirectory(atPath: cacheDir, withIntermediateDirectories: true)
                         litert_lm_engine_settings_set_cache_dir(settings, cacheDir)
 
@@ -349,20 +361,20 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             return
         }
 
-        for name in iOSGpuRuntimeDylibs {
-            guard let url = runtimeDylibURL(named: name, frameworkURL: frameworkURL) else {
-                log.warning("LiteRT GPU runtime dylib missing: \(name)")
+        for plugin in iOSGpuRuntimePlugins {
+            guard let url = runtimePluginURL(plugin, frameworkURL: frameworkURL) else {
+                log.warning("LiteRT GPU runtime plugin missing: \(plugin.dylibName)")
                 continue
             }
 
             guard FileManager.default.fileExists(atPath: url.path) else {
-                log.warning("LiteRT GPU runtime dylib missing: \(name)")
+                log.warning("LiteRT GPU runtime plugin missing: \(plugin.dylibName)")
                 continue
             }
 
             if dlopen(url.path, RTLD_NOW | RTLD_GLOBAL) == nil {
                 let message = dlerror().map { String(cString: $0) } ?? "unknown dlopen error"
-                log.warning("Failed to preload \(name): \(message)")
+                log.warning("Failed to preload \(plugin.dylibName): \(message)")
             }
         }
         #endif
@@ -380,20 +392,46 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         return nil
     }
 
-    private static func runtimeDylibURL(named name: String, frameworkURL: URL) -> URL? {
+    private static func runtimePluginURL(_ plugin: RuntimePlugin, frameworkURL: URL) -> URL? {
+        let name = plugin.dylibName
+        let wrappedFrameworkExecutable = "\(plugin.wrappedFrameworkName).framework/\(plugin.wrappedFrameworkName)"
         let candidates = [
             frameworkURL.appendingPathComponent(name),
             frameworkURL.deletingLastPathComponent().appendingPathComponent(name),
+            frameworkURL.deletingLastPathComponent().appendingPathComponent(wrappedFrameworkExecutable),
             Bundle.main.privateFrameworksURL?.appendingPathComponent(name),
+            Bundle.main.privateFrameworksURL?.appendingPathComponent(wrappedFrameworkExecutable),
             Bundle.main.executableURL?
                 .deletingLastPathComponent()
                 .appendingPathComponent("Frameworks")
                 .appendingPathComponent(name),
+            Bundle.main.executableURL?
+                .deletingLastPathComponent()
+                .appendingPathComponent("Frameworks")
+                .appendingPathComponent(wrappedFrameworkExecutable),
         ]
 
         return candidates.compactMap { $0 }.first {
             FileManager.default.fileExists(atPath: $0.path)
         }
+    }
+
+    private static func cacheDirectory(
+        backend: String,
+        modalities: EnabledModalities,
+        maxNumTokens: Int,
+        speculativeDecodingEnabled: Bool
+    ) -> URL {
+        let normalizedBackend = backend.lowercased()
+        let modalityScope = "modalities-\(modalities.rawValue)"
+        let contextScope = "ctx-\(maxNumTokens)"
+        let speculativeScope = speculativeDecodingEnabled ? "mtp" : "base"
+        return FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("litertlm_cache_v2", isDirectory: true)
+            .appendingPathComponent(normalizedBackend, isDirectory: true)
+            .appendingPathComponent(modalityScope, isDirectory: true)
+            .appendingPathComponent(contextScope, isDirectory: true)
+            .appendingPathComponent(speculativeScope, isDirectory: true)
     }
 
     private func ensureModalityEnabled(_ modality: EnabledModalities, name: String) throws {
