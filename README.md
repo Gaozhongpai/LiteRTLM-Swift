@@ -2,7 +2,7 @@
 
 Swift wrapper for running LiteRT-LM models on iOS.
 
-This fork is intentionally **Conversation API first**. MiloFlow uses it for stateful local chat, multimodal turns, tool calling, eager preface prewarm, and runtime-probed conversation cloning.
+This fork is intentionally **Conversation API first**. MiloFlow uses it for stateful local chat, multimodal turns, tool calling, eager preface prewarm, and runtime-probed conversation cloning. Clone-dependent features must stay guarded because clone support is backend-dependent even when the C symbol is present.
 
 ## Supported Path
 
@@ -29,7 +29,7 @@ This path handles prompt formatting internally and supports:
 - mixed multimodal turns
 - tool calls and tool results
 - system prompt, tools, and restored-history prewarm
-- stored conversation branches and clone activation
+- stored conversation branches and clone activation when the runtime probe succeeds
 
 The older one-shot and Session APIs still compile for compatibility and fallback flows, but they are not the recommended MiloFlow integration path because they require manual prompt formatting and do not support the full conversation state model.
 
@@ -46,7 +46,9 @@ The older one-shot and Session APIs still compile for compatibility and fallback
 let engine = LiteRTLMEngine(
     modelPath: modelURL,
     backend: "cpu",
+    visionBackend: nil,
     enabledModalities: [.vision, .audio],
+    maxNumTokens: 8192,
     maxNumImages: 4,
     enableBenchmarking: true
 )
@@ -54,7 +56,7 @@ let engine = LiteRTLMEngine(
 try await engine.load()
 ```
 
-`backend: "gpu"` is available but should be treated as experimental on iOS. Text may use GPU when supported; vision/audio executor sections are still loaded conservatively.
+`backend: "gpu"` is available but should be treated as experimental on iOS. Text may use GPU when supported. Vision defaults to the CPU-safe executor; pass `visionBackend: "gpu"` only when you want to try LiteRT-LM's experimental GPU vision path with an app-level CPU fallback.
 
 ## Conversation Turns
 
@@ -149,7 +151,7 @@ Official upstream LiteRT-LM already has the native C++ `ConversationConfig::Buil
 
 ## Conversation Branching
 
-Branching is automatic when supported by the loaded backend:
+Branching is automatic only when the loaded backend passes the runtime clone probe:
 
 ```swift
 if engine.supportsConversationClone {
@@ -165,7 +167,14 @@ if engine.supportsConversationClone {
 }
 ```
 
-`supportsConversationClone` is probed once during `load()`. Current upstream exposes `litert_lm_conversation_clone`; supported `SessionAdvanced` loads can clone, while `SessionBasic` still returns unsupported. Callers must fall back to `openConversation` when the probe is false.
+`supportsConversationClone` is probed once during `load()`. Current upstream exposes `litert_lm_conversation_clone`, but that only proves the API is exported. The loaded engine must also be able to create and clone independent conversation contexts.
+
+For MiloFlow's current iOS Gemma 4 E2B compiled-model path, the probe can still return `false`. Known failure modes are:
+
+- `SessionBasic` returns the base `Session::Clone()` `UnimplementedError`.
+- `SessionAdvanced` is selected but conversation creation fails with `CreateNewContext not implemented for backend: LiteRT Compiled Model`.
+
+Callers must fall back to `openConversation` when the probe is false. Replacing the `.litertlm` model file alone is not enough to enable branching unless the engine/backend used by that file implements the required context creation and clone paths.
 
 MiloFlow enables the branch path in app code and automatically disables it if the runtime probe fails.
 

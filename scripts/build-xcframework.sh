@@ -17,9 +17,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 OUTPUT_DIR="$PROJECT_DIR/Frameworks/LiteRTLM.xcframework"
+USE_ADVANCED_ENGINE="${LITERTLM_USE_ADVANCED_ENGINE:-0}"
 WORK_DIR="$(mktemp -d)"
 LITERT_BUILD_FILE=""
 LITERT_BUILD_BACKUP=""
+LITERT_CORE_BUILD_FILE=""
+LITERT_CORE_BUILD_BACKUP=""
 LITERT_ENGINE_CC=""
 LITERT_ENGINE_CC_BACKUP=""
 LITERT_ENGINE_H=""
@@ -29,6 +32,9 @@ cleanup() {
     local status=$?
     if [ -n "${LITERT_BUILD_FILE:-}" ] && [ -n "${LITERT_BUILD_BACKUP:-}" ] && [ -f "$LITERT_BUILD_BACKUP" ]; then
         cp "$LITERT_BUILD_BACKUP" "$LITERT_BUILD_FILE"
+    fi
+    if [ -n "${LITERT_CORE_BUILD_FILE:-}" ] && [ -n "${LITERT_CORE_BUILD_BACKUP:-}" ] && [ -f "$LITERT_CORE_BUILD_BACKUP" ]; then
+        cp "$LITERT_CORE_BUILD_BACKUP" "$LITERT_CORE_BUILD_FILE"
     fi
     if [ -n "${LITERT_ENGINE_CC:-}" ] && [ -n "${LITERT_ENGINE_CC_BACKUP:-}" ] && [ -f "$LITERT_ENGINE_CC_BACKUP" ]; then
         cp "$LITERT_ENGINE_CC_BACKUP" "$LITERT_ENGINE_CC"
@@ -69,10 +75,71 @@ fi
 
 LITERT_LM_DIR="$(cd "$LITERT_LM_DIR" && pwd)"
 LITERT_BUILD_FILE="$LITERT_LM_DIR/c/BUILD"
+LITERT_CORE_BUILD_FILE="$LITERT_LM_DIR/runtime/core/BUILD"
 LITERT_ENGINE_CC="$LITERT_LM_DIR/c/engine.cc"
 LITERT_ENGINE_H="$LITERT_LM_DIR/c/engine.h"
 
 info "Using LiteRT-LM source at: $LITERT_LM_DIR"
+if [ "$USE_ADVANCED_ENGINE" = "1" ]; then
+    info "Packaging with LiteRT-LM advanced engine (conversation clone capable when backend supports CreateNewContext)"
+else
+    info "Packaging with LiteRT-LM basic engine (stable default for LiteRT compiled-model backend)"
+fi
+
+# Upstream has the advanced engine/session implementation in source, but some
+# checkouts do not expose it from Bazel. Add the missing targets temporarily so
+# CLiteRTLM uses SessionAdvanced, which implements conversation cloning.
+if [ "$USE_ADVANCED_ENGINE" = "1" ] && ! grep -q 'name = "engine_advanced_impl"' "$LITERT_CORE_BUILD_FILE"; then
+    warn "Injecting temporary advanced engine Bazel targets"
+    LITERT_CORE_BUILD_BACKUP="$WORK_DIR/runtime_core_BUILD.orig"
+    cp "$LITERT_CORE_BUILD_FILE" "$LITERT_CORE_BUILD_BACKUP"
+    cat >> "$LITERT_CORE_BUILD_FILE" << 'BAZEL_TARGET'
+
+# Added temporarily by LiteRTLM-Swift/scripts/build-xcframework.sh.
+cc_library(
+    name = "session_advanced",
+    srcs = ["session_advanced.cc"],
+    hdrs = ["session_advanced.h"],
+    deps = [
+        ":session_utils",
+        "@com_google_absl//absl/base:nullability",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/functional:any_invocable",
+        "@com_google_absl//absl/log:absl_log",
+        "@com_google_absl//absl/log:log",
+        "@com_google_absl//absl/memory",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "//runtime/components:tokenizer",
+        "//runtime/engine:engine_interface",
+        "//runtime/engine:engine_settings",
+        "//runtime/engine:io_types",
+        "//runtime/framework/resource_management:execution_manager",
+        "//runtime/proto:sampler_params_cc_proto",
+    ],
+)
+
+cc_library(
+    name = "engine_advanced_impl",
+    srcs = ["engine_advanced_impl.cc"],
+    deps = ENGINE_IMPL_COMMON_DEPS + [
+        ":session_advanced",
+        "//runtime/components:default_static_gpu_samplers",
+        "//runtime/executor:default_static_gpu_accelerator",
+        "//runtime/framework/resource_management:execution_manager",
+        "//runtime/framework/resource_management:serial_execution_manager",
+        "//runtime/framework/resource_management:threaded_execution_manager",
+        "//runtime/util:litert_util",
+    ],
+    alwayslink = 1,
+)
+BAZEL_TARGET
+fi
 
 # Official LiteRT-LM exposes the C library target but not an iOS shared-library
 # target with the framework binary name this Swift package ships. Add that
@@ -81,6 +148,33 @@ if ! grep -q 'name = "libLiteRTLMEngine.dylib"' "$LITERT_BUILD_FILE"; then
     warn "Injecting temporary //c:libLiteRTLMEngine.dylib build target"
     LITERT_BUILD_BACKUP="$WORK_DIR/c_BUILD.orig"
     cp "$LITERT_BUILD_FILE" "$LITERT_BUILD_BACKUP"
+    if [ "$USE_ADVANCED_ENGINE" = "1" ]; then
+    cat >> "$LITERT_BUILD_FILE" << 'BAZEL_TARGET'
+
+# Added temporarily by LiteRTLM-Swift/scripts/build-xcframework.sh.
+cc_library(
+    name = "engine_advanced",
+    srcs = [
+        "engine.cc",
+    ],
+    hdrs = [
+        "engine.h",
+    ],
+    deps = ENGINE_COMMON_DEPS + [
+        "//runtime/core:engine_advanced_impl",
+    ],
+    alwayslink = True,
+)
+
+cc_binary(
+    name = "libLiteRTLMEngine.dylib",
+    linkshared = True,
+    deps = [
+        ":engine_advanced",
+    ],
+)
+BAZEL_TARGET
+    else
     cat >> "$LITERT_BUILD_FILE" << 'BAZEL_TARGET'
 
 # Added temporarily by LiteRTLM-Swift/scripts/build-xcframework.sh.
@@ -92,6 +186,7 @@ cc_binary(
     ],
 )
 BAZEL_TARGET
+    fi
 fi
 
 # Official upstream has the C++ ConversationConfig flag for eager preface

@@ -125,9 +125,11 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
     private let modelPath: URL
     private let backend: String
+    private let visionBackend: String?
     private let speculativeDecodingPreference: Bool?
     private let parallelFileSectionLoading: Bool
     private let prefillChunkSize: Int?
+    private let maxNumTokens: Int
     private let maxNumImages: Int?
     private let benchmarkingEnabled: Bool
     public let enabledModalities: EnabledModalities
@@ -153,28 +155,31 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     /// - Parameters:
     ///   - modelPath: Path to the `.litertlm` model file on disk.
     ///   - backend: Main/text compute backend — `"cpu"` or `"gpu"` (GPU uses Metal on iOS).
-    ///     Vision and audio encoders remain on CPU because Gemma 4 E2B's
-    ///     non-text sections are packaged with backend constraints or GPU
-    ///     delegate ops that are not stable on iOS.
+    ///   - visionBackend: Optional vision executor backend — `"cpu"` or `"gpu"`.
+    ///     `nil` keeps LiteRTLMSwift's CPU-safe default when `.vision` is enabled.
     ///   - enabledModalities: Optional non-text executors to configure at load
     ///     time. Use `.textOnly` for lower resident memory when the app already
     ///     converts speech/images before calling the LLM.
     public init(
         modelPath: URL,
         backend: String = "cpu",
+        visionBackend: String? = nil,
         enableSpeculativeDecoding: Bool? = nil,
         enabledModalities: EnabledModalities = .all,
         parallelFileSectionLoading: Bool = true,
         prefillChunkSize: Int? = nil,
+        maxNumTokens: Int = 4096,
         maxNumImages: Int? = nil,
         enableBenchmarking: Bool = true
     ) {
         self.modelPath = modelPath
         self.backend = backend
+        self.visionBackend = visionBackend
         self.speculativeDecodingPreference = enableSpeculativeDecoding
         self.enabledModalities = enabledModalities
         self.parallelFileSectionLoading = parallelFileSectionLoading
         self.prefillChunkSize = prefillChunkSize
+        self.maxNumTokens = maxNumTokens
         self.maxNumImages = maxNumImages
         self.benchmarkingEnabled = enableBenchmarking
     }
@@ -213,8 +218,13 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
         let path = modelPath.path
         let backendStr = self.backend
-        let visionBackendStr: String? = enabledModalities.contains(.vision) ? "cpu" : nil
+        let requestedVisionBackend = self.visionBackend?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let visionBackendStr: String? = enabledModalities.contains(.vision)
+            ? ((requestedVisionBackend?.isEmpty == false) ? requestedVisionBackend : "cpu")
+            : nil
         let audioBackendStr: String? = enabledModalities.contains(.audio) ? "cpu" : nil
+        let textUsesGPU = backendStr.caseInsensitiveCompare("gpu") == .orderedSame
+        let visionUsesGPU = visionBackendStr.map { $0.caseInsensitiveCompare("gpu") == .orderedSame } ?? false
         let enableSpeculativeDecoding = speculativeDecodingPreference
             ?? Self.modelSupportsSpeculativeDecoding(path: path)
         let startTime = CFAbsoluteTimeGetCurrent()
@@ -236,7 +246,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                         // 3=warning, 4=error, 5=fatal, 1000=silent.
                         litert_lm_set_min_log_level(4)
 
-                        if backendStr.caseInsensitiveCompare("gpu") == .orderedSame {
+                        if textUsesGPU || visionUsesGPU {
                             Self.preloadGpuRuntimeDylibsIfNeeded()
                         }
 
@@ -246,7 +256,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                             throw LiteRTLMError.engineCreationFailed("Failed to create engine settings")
                         }
 
-                        if backendStr.caseInsensitiveCompare("gpu") == .orderedSame {
+                        if textUsesGPU {
                             // The C bridge defaults GPU text activations to FP32,
                             // but LiteRT-LM's text default is FP16 and some iOS
                             // GPU compiled-model paths fail at engine creation
@@ -254,7 +264,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                             litert_lm_engine_settings_set_activation_data_type(settings, 1)
                         }
 
-                        litert_lm_engine_settings_set_max_num_tokens(settings, 4096)
+                        litert_lm_engine_settings_set_max_num_tokens(settings, Int32(max(1, self.maxNumTokens)))
                         litert_lm_engine_settings_set_parallel_file_section_loading(settings, self.parallelFileSectionLoading)
 
                         if let prefillChunkSize = self.prefillChunkSize, prefillChunkSize > 0 {
