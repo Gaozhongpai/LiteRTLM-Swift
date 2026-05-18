@@ -169,6 +169,9 @@ cc_library(
 cc_binary(
     name = "libLiteRTLMEngine.dylib",
     linkshared = True,
+    linkopts = [
+        "-Wl,-u,_litert_lm_conversation_config_set_prefill_preface_on_init",
+    ],
     deps = [
         ":engine_advanced",
     ],
@@ -181,6 +184,9 @@ BAZEL_TARGET
 cc_binary(
     name = "libLiteRTLMEngine.dylib",
     linkshared = True,
+    linkopts = [
+        "-Wl,-u,_litert_lm_conversation_config_set_prefill_preface_on_init",
+    ],
     deps = [
         ":engine",
     ],
@@ -201,9 +207,16 @@ if ! grep -q 'litert_lm_conversation_config_set_prefill_preface_on_init' "$LITER
     cp "$LITERT_ENGINE_H" "$LITERT_ENGINE_H_BACKUP"
 
     perl -0pi -e 's/(  bool filter_channel_content_from_kv_cache = false;\n)/$1  bool prefill_preface_on_init = false;\n/' "$LITERT_ENGINE_CC"
-    perl -0pi -e 's/(void litert_lm_conversation_config_set_filter_channel_content_from_kv_cache\(\n    LiteRtLmConversationConfig\* config,\n    bool filter_channel_content_from_kv_cache\) \{\n  if \(config\) \{\n    config->filter_channel_content_from_kv_cache =\n        filter_channel_content_from_kv_cache;\n  \}\n\}\n)/$1\nvoid litert_lm_conversation_config_set_prefill_preface_on_init(\n    LiteRtLmConversationConfig* config, bool prefill_preface_on_init) {\n  if (config) {\n    config->prefill_preface_on_init = prefill_preface_on_init;\n  }\n}\n/' "$LITERT_ENGINE_CC"
+    perl -0pi -e 's/(void litert_lm_conversation_config_set_filter_channel_content_from_kv_cache\(\n    LiteRtLmConversationConfig\* config,\n    bool filter_channel_content_from_kv_cache\) \{\n  if \(config\) \{\n    config->filter_channel_content_from_kv_cache =\n        filter_channel_content_from_kv_cache;\n  \}\n\}\n)/$1\nLITERT_LM_C_API_EXPORT\nvoid litert_lm_conversation_config_set_prefill_preface_on_init(\n    LiteRtLmConversationConfig* config, bool prefill_preface_on_init) {\n  if (config) {\n    config->prefill_preface_on_init = prefill_preface_on_init;\n  }\n}\n/' "$LITERT_ENGINE_CC"
     perl -0pi -e 's/(    builder\.SetFilterChannelContentFromKvCache\(\n        c_config->filter_channel_content_from_kv_cache\);\n)/$1    builder.SetPrefillPrefaceOnInit(c_config->prefill_preface_on_init);\n/' "$LITERT_ENGINE_CC"
     perl -0pi -e 's/(void litert_lm_conversation_config_set_filter_channel_content_from_kv_cache\(\n    LiteRtLmConversationConfig\* config,\n    bool filter_channel_content_from_kv_cache\);\n)/$1\n\/\/ Sets whether the conversation should prefill the preface \(system message,\n\/\/ tools, and history\) into the KV cache during conversation creation. When\n\/\/ true, the prefill cost is paid up front by litert_lm_conversation_create;\n\/\/ the first user turn then only prefills the new turn. When false \(default\),\n\/\/ the entire context is prefilled on the first turn.\n\/\/ @param config The config to modify.\n\/\/ @param prefill_preface_on_init Whether to prefill the preface at init.\nLITERT_LM_C_API_EXPORT\nvoid litert_lm_conversation_config_set_prefill_preface_on_init(\n    LiteRtLmConversationConfig* config, bool prefill_preface_on_init);\n/' "$LITERT_ENGINE_H"
+
+    if ! grep -q 'LITERT_LM_C_API_EXPORT' "$LITERT_ENGINE_CC" ||
+       ! grep -q 'config->prefill_preface_on_init = prefill_preface_on_init' "$LITERT_ENGINE_CC" ||
+       ! grep -q 'builder.SetPrefillPrefaceOnInit(c_config->prefill_preface_on_init)' "$LITERT_ENGINE_CC" ||
+       ! grep -q 'litert_lm_conversation_config_set_prefill_preface_on_init' "$LITERT_ENGINE_H"; then
+        error "Failed to inject prefill_preface_on_init C API shim; LiteRT-LM source layout may have changed"
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -244,6 +257,15 @@ BAZEL_XCODE_FLAGS=(
 
 info "Pinning Bazel to Xcode $XCODE_SHORT_VERSION ($XCODE_BUILD_VERSION)"
 
+verify_exported_symbol() {
+    local BINARY="$1"
+    local SYMBOL="$2"
+
+    if ! nm -gU "$BINARY" | awk -v symbol="_$SYMBOL" '$3 == symbol { found = 1 } END { exit !found }'; then
+        error "Built binary is missing required exported symbol: _$SYMBOL ($BINARY)"
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # 3. Build for iOS device (arm64)
 # ---------------------------------------------------------------------------
@@ -251,12 +273,20 @@ info "Pinning Bazel to Xcode $XCODE_SHORT_VERSION ($XCODE_BUILD_VERSION)"
 info "Building for iOS device (arm64)..."
 cd "$LITERT_LM_DIR"
 
+if [ "${LITERTLM_SKIP_BAZEL_CLEAN:-0}" = "1" ]; then
+    warn "Skipping Bazel clean because LITERTLM_SKIP_BAZEL_CLEAN=1"
+else
+    info "Cleaning Bazel outputs so temporary C API shims cannot reuse stale artifacts..."
+    $BAZEL_CMD clean
+fi
+
 $BAZEL_CMD build "${BAZEL_XCODE_FLAGS[@]}" --config=ios_arm64 //c:libLiteRTLMEngine.dylib
 
 DEVICE_DYLIB="$LITERT_LM_DIR/bazel-bin/c/libLiteRTLMEngine.dylib"
 if [ ! -f "$DEVICE_DYLIB" ]; then
     error "Device build failed: $DEVICE_DYLIB not found"
 fi
+verify_exported_symbol "$DEVICE_DYLIB" litert_lm_conversation_config_set_prefill_preface_on_init
 info "Device build OK: $(du -h "$DEVICE_DYLIB" | cut -f1)"
 
 # ---------------------------------------------------------------------------
@@ -271,6 +301,7 @@ SIM_DYLIB="$LITERT_LM_DIR/bazel-bin/c/libLiteRTLMEngine.dylib"
 if [ ! -f "$SIM_DYLIB" ]; then
     error "Simulator build failed: $SIM_DYLIB not found"
 fi
+verify_exported_symbol "$SIM_DYLIB" litert_lm_conversation_config_set_prefill_preface_on_init
 info "Simulator build OK: $(du -h "$SIM_DYLIB" | cut -f1)"
 
 # Copy simulator dylib aside (Bazel overwrites bazel-bin between configs)
@@ -281,6 +312,7 @@ cp "$SIM_DYLIB" "$SIM_DYLIB_COPY"
 info "Restoring device build..."
 $BAZEL_CMD build "${BAZEL_XCODE_FLAGS[@]}" --config=ios_arm64 //c:libLiteRTLMEngine.dylib
 DEVICE_DYLIB="$LITERT_LM_DIR/bazel-bin/c/libLiteRTLMEngine.dylib"
+verify_exported_symbol "$DEVICE_DYLIB" litert_lm_conversation_config_set_prefill_preface_on_init
 
 # Also grab companion dylibs if present. LiteRT-LM loads the Metal GPU
 # accelerator and sampler dynamically at runtime, so they must be shipped next

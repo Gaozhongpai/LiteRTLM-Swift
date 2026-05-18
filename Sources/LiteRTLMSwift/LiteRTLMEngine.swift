@@ -53,6 +53,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
     private struct ConversationOptions: Sendable, Equatable {
         var extraContextJSON: String?
+        // Kept for source compatibility with newer wrapper call sites. The
+        // pinned Google LiteRT-LM C API does not expose visual-token budgeting.
         var visualTokenBudget: Int?
 
         init(
@@ -115,9 +117,10 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     /// Whether the engine is ready for inference (text, vision, and audio).
     public var isReady: Bool { status == .ready }
 
-    /// Whether the loaded backend supports `litert_lm_conversation_clone`.
-    /// Probed once at load time. Current upstream exposes the C API and
-    /// supports it through SessionAdvanced; SessionBasic still returns false.
+    /// Whether the loaded backend supports conversation cloning.
+    ///
+    /// Some LiteRT-LM snapshots do not export the C clone API at all. In that
+    /// default build, this remains false and clone-dependent branch APIs throw.
     public private(set) var supportsConversationClone: Bool = false
 
     /// Whether this engine load enabled LiteRT-LM speculative decoding.
@@ -279,10 +282,6 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                             litert_lm_engine_settings_set_prefill_chunk_size(settings, Int32(prefillChunkSize))
                         }
 
-                        if let maxNumImages = self.maxNumImages, maxNumImages > 0 {
-                            litert_lm_engine_settings_set_max_num_images(settings, Int32(maxNumImages))
-                        }
-
                         if enableSpeculativeDecoding {
                             litert_lm_engine_settings_set_enable_speculative_decoding(settings, true)
                         }
@@ -320,9 +319,13 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             }
             isSpeculativeDecodingEnabled = enableSpeculativeDecoding
 
+            #if LITERTLM_HAS_CONVERSATION_CLONE
             let cloneSupported = inferenceQueue.sync {
                 Self.probeConversationCloneSupport(engine: createdEngine)
             }
+            #else
+            let cloneSupported = false
+            #endif
             inferenceQueue.sync { self.supportsConversationClone = cloneSupported }
             Self.log.info("Conversation clone supported: \(cloneSupported)")
             Self.log.info("Speculative decoding enabled: \(enableSpeculativeDecoding)")
@@ -986,8 +989,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     }
 
     /// Save a clone of the currently-open persistent conversation into a named
-    /// branch. Requires a CLiteRTLM build that exports
-    /// `litert_lm_conversation_clone`.
+    /// branch. Requires a CLiteRTLM build compiled with conversation clone
+    /// support.
     public func saveConversationBranch(_ branchID: String) async throws {
         try ensureReady()
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
@@ -2028,12 +2031,18 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     }
 
     private func cloneConversationHandle(_ conversation: OpaquePointer) throws -> OpaquePointer {
+        #if LITERTLM_HAS_CONVERSATION_CLONE
         guard let cloned = litert_lm_conversation_clone(conversation) else {
             throw LiteRTLMError.inferenceFailure(
                 "Conversation clone unsupported by current session backend (likely SessionBasic). Check engine.supportsConversationClone before calling clone APIs."
             )
         }
         return cloned
+        #else
+        throw LiteRTLMError.inferenceFailure(
+            "Conversation clone unsupported by this CLiteRTLM build. Check engine.supportsConversationClone before calling clone APIs."
+        )
+        #endif
     }
 
     /// Probes whether the active engine backend implements `Session::Clone`.
@@ -2041,6 +2050,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     /// SessionAdvanced returns a real cloned conversation, while SessionBasic
     /// still falls back to `UnimplementedError`.
     private static func probeConversationCloneSupport(engine eng: OpaquePointer) -> Bool {
+        #if LITERTLM_HAS_CONVERSATION_CLONE
         guard let sessionConfig = litert_lm_session_config_create() else { return false }
         defer { litert_lm_session_config_delete(sessionConfig) }
 
@@ -2054,6 +2064,9 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         guard let cloned = litert_lm_conversation_clone(conversation) else { return false }
         litert_lm_conversation_delete(cloned)
         return true
+        #else
+        return false
+        #endif
     }
 
     private func deleteStoredConversationBranchLocked(_ branchID: String) {
@@ -2073,32 +2086,14 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
     private nonisolated static func withConversationOptions<T>(
         _ options: ConversationOptions,
-        _ body: (UnsafePointer<CChar>?, OpaquePointer?) throws -> T
+        _ body: (UnsafePointer<CChar>?) throws -> T
     ) rethrows -> T {
         let extraContext = options.extraContextJSON?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanExtraContext = (extraContext?.isEmpty == false) ? extraContext : nil
 
-        let optionalArgs: OpaquePointer?
-        if let visualTokenBudget = options.visualTokenBudget, visualTokenBudget > 0 {
-            optionalArgs = litert_lm_conversation_optional_args_create()
-            if let optionalArgs {
-                litert_lm_conversation_optional_args_set_visual_token_budget(
-                    optionalArgs,
-                    Int32(visualTokenBudget)
-                )
-            }
-        } else {
-            optionalArgs = nil
-        }
-        defer {
-            if let optionalArgs {
-                litert_lm_conversation_optional_args_delete(optionalArgs)
-            }
-        }
-
         return try withOptionalCString(cleanExtraContext) { extraContextPtr in
-            try body(extraContextPtr, optionalArgs)
+            try body(extraContextPtr)
         }
     }
 
@@ -2217,9 +2212,9 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                         litert_lm_session_config_delete(sessionConfig)
                     }
 
-                    guard let response = try Self.withConversationOptions(conversationOptions, { extraContextPtr, optionalArgs in
+                    guard let response = try Self.withConversationOptions(conversationOptions, { extraContextPtr in
                         messageJSON.withCString { msgPtr in
-                            litert_lm_conversation_send_message(conversation, msgPtr, extraContextPtr, optionalArgs)
+                            litert_lm_conversation_send_message(conversation, msgPtr, extraContextPtr)
                         }
                     }) else {
                         throw LiteRTLMError.inferenceFailure("Conversation returned no response")
@@ -2269,9 +2264,9 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                         throw LiteRTLMError.inferenceFailure("No persistent conversation open — call openConversation() first")
                     }
 
-                    guard let response = try Self.withConversationOptions(conversationOptions, { extraContextPtr, optionalArgs in
+                    guard let response = try Self.withConversationOptions(conversationOptions, { extraContextPtr in
                         messageJSON.withCString { msgPtr in
-                            litert_lm_conversation_send_message(conversation, msgPtr, extraContextPtr, optionalArgs)
+                            litert_lm_conversation_send_message(conversation, msgPtr, extraContextPtr)
                         }
                     }) else {
                         throw LiteRTLMError.inferenceFailure("Persistent conversation returned no response")
@@ -2314,10 +2309,10 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
                 let callResult: Int32
                 do {
-                    callResult = try Self.withConversationOptions(conversationOptions) { extraContextPtr, optionalArgs in
+                    callResult = try Self.withConversationOptions(conversationOptions) { extraContextPtr in
                         messageJSON.withCString { msgPtr -> Int32 in
                             litert_lm_conversation_send_message_stream(
-                                conversation, msgPtr, extraContextPtr, optionalArgs,
+                                conversation, msgPtr, extraContextPtr,
                                 { callbackData, chunk, isFinal, errorMsg in
                             guard let cbData = callbackData else { return }
                             let st = Unmanaged<ToolStreamCallbackState>.fromOpaque(cbData)
@@ -2402,10 +2397,10 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
                 let callResult: Int32
                 do {
-                    callResult = try Self.withConversationOptions(conversationOptions) { extraContextPtr, optionalArgs in
+                    callResult = try Self.withConversationOptions(conversationOptions) { extraContextPtr in
                         messageJSON.withCString { msgPtr -> Int32 in
                             litert_lm_conversation_send_message_stream(
-                                conversation, msgPtr, extraContextPtr, optionalArgs,
+                                conversation, msgPtr, extraContextPtr,
                                 { callbackData, chunk, isFinal, errorMsg in
                             guard let cbData = callbackData else { return }
                             let st = Unmanaged<StreamCallbackState>.fromOpaque(cbData)
